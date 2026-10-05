@@ -16,7 +16,7 @@ _The complete RAG learning guide in one document. It follows the order the data 
    - [Step 4: Normalization](#step-4-normalization)
 4. [Storing vectors in Qdrant](#4-storing-vectors-in-qdrant)
 5. [Searching](#5-searching)
-6. [Generating the answer](#6-generating-the-answer)
+6. [Generating the answer: the LLM side](#6-generating-the-answer-the-llm-side)
 7. [Chunk size vs dimensions vs accuracy](#7-chunk-size-vs-dimensions-vs-accuracy)
 8. [Mapping to code](#8-mapping-to-code)
 9. [Common confusions](#9-common-confusions)
@@ -85,6 +85,54 @@ ASK / QUERY FLOW (every question)
 **The key rule:** chunks and questions must be embedded with the **same model and the same steps**. Only then are their vectors comparable.
 
 Sections 2 to 6 follow this flow in order. `[EMBED]` is explained in section 3.
+
+### 1.5 One-page recap (for revision)
+
+**Saving a chunk (indexing):**
+
+```
+chunk text
+  │ tokenizer                              → token IDs                       [1, n]
+  │ transformer
+  │   embedding lookup (ID → table row)     → one vector per token            [1, n, 384]
+  │   + position vectors                   → vectors that know word order
+  │   × 6 layers of (attention + feed-forward):
+  │       Q, K, V = vectors × Wq, Wk, Wv    (frozen weights)
+  │       scores  = Q·Kᵀ / √d               → n × n grid
+  │       weights = softmax(scores)         → each row sums to 1
+  │       new vector = weights × V          → context-mixed vector per token
+  ▼
+token vectors                                                              [1, n, 384]
+  │ mean pooling (average, ignore padding)  → one vector per text           [1, 384]
+  │ L2 normalization (divide by length)     → length 1, values in -1..1
+  ▼
+Qdrant point: { id, vector[384], payload: chunk text + metadata }
+  → vector is added to the collection's HNSW index (distance = Cosine)
+```
+
+**Retrieving (query):**
+
+```
+question → same steps (tokenizer → transformer → pooling → normalization) → query vector [384]
+  │ Qdrant ANN (HNSW) search: walks the graph, comparing vectors with the collection's metric
+  │   (cosine; for unit vectors that is a plain dot product)
+  ▼
+top-K points (score + payload)
+  │ take the payload TEXT of each point
+  ▼
+prompt = instructions + chunk texts + history + question
+  → LLM (its OWN tokenizer and model) → streamed answer
+```
+
+**Easy-to-mix-up points:**
+
+| Mix-up | Correct |
+|---|---|
+| "Add position: K" | Position vectors are added to the token vectors **before** attention. K is computed **afterwards** from those vectors (K = vector × Wk) |
+| "Dot product with K gives the new vector" | K is only used for the **scores**. New vector = softmax weights × **V** |
+| "Normalization adds direction" | Direction is already in the vector. Normalization **removes the length** (length becomes 1) and keeps direction. Values end up in -1..1 as a result |
+| "ANN, not sure about cosine" | ANN (HNSW) is the **search method**; cosine/dot is the **measure** it uses to compare vectors. It is set on the collection |
+| "Give results to the LLM" | The LLM gets the chunk **text** (payload), never the vectors |
 
 ---
 
@@ -674,6 +722,21 @@ await axios.put(`${BASE_URL}/collections/${collection}`, {
 
 Our app uses a collection per user for complete data isolation. That works at small scale; at large scale a shared collection filtered by a `userId` payload is used instead (see [RAG_SCALING_HLD.md](./RAG_SCALING_HLD.md)).
 
+### How a chunk is saved
+
+```
+chunk text → embed → unit vector [384]
+
+upsert a point: { id: <uuid>, vector: [... 384 numbers ...], payload: { text, fileName, ... } }
+  → Qdrant stores the vector and the payload
+  → the vector is linked into the collection's HNSW graph (see 5.6) next to its nearest neighbours
+```
+
+- Upserting the same `id` again **overwrites** the point, so re-indexing a changed document updates it in place (deterministic IDs make this repeatable).
+- Vector and payload travel together, so a search result already contains the chunk text.
+- Payload fields (for example `userId`, `docId`) can be used as filters during search.
+- For `Cosine`, Qdrant normalizes the vector on insert (ours are already unit length).
+
 ---
 
 ## 5. Searching
@@ -784,24 +847,189 @@ The absolute gap stays 50 km, but the relative gap shrinks from 100% to 5%, so r
 
 **Isotropic vs anisotropic (side note).** Rotate the point `(3, 4)` to `(5, 0)`. Euclidean distance from the origin stays 5 (rotation-invariant), Manhattan changes from 7 to 5. Embedding dimensions have no fixed meaning (it is smeared across them), so a metric shouldn't depend on axis orientation. Euclidean, cosine and dot product are rotation-invariant. Manhattan is not.
 
+### 5.6 How ANN search works (HNSW)
+
+**Exact search** compares the query with every stored vector (n comparisons of 384 numbers each). For millions of vectors that is too slow, so vector databases use **ANN** (approximate nearest neighbour) indexes. Qdrant uses **HNSW** (Hierarchical Navigable Small World).
+
+Idea: build a graph where each vector is a node linked to some nearby vectors, in layers like a map: the top layers have few nodes with long links (highways), the bottom layer has all nodes with short links (streets).
+
+```
+Layer 2:   A ─────────────────── F              few nodes, long jumps
+Layer 1:   A ─────── C ───────── F ──── H       more nodes
+Layer 0:   A B C D E F G H I J ...              every vector, short links to near neighbours
+```
+
+Search:
+1. Start at an entry node in the top layer.
+2. Greedily move to the neighbour closest to the query until no neighbour is closer.
+3. Drop to the next layer and continue from that node.
+4. On layer 0, explore a small candidate list, keep the best K.
+
+It visits only a tiny fraction of the vectors (cost grows roughly with the logarithm of n), which is how millions of vectors are searched in milliseconds.
+
+- **Approximate:** it can miss a true nearest neighbour. The trade-off is tunable: `m` (links per node) and `ef_construct` (build effort) when creating the collection, `hnsw_ef` (search effort) at query time. Higher values give better recall but slower search.
+- **Where cosine fits:** every "which neighbour is closer to the query?" decision inside HNSW uses the collection's metric. With normalized vectors that is a plain dot product. ANN is the method, cosine is the measure.
+
 ---
 
-## 6. Generating the answer
+## 6. Generating the answer: the LLM side
 
-The top chunks are placed in the prompt and sent to the LLM, which streams the answer back:
+Everything so far used the **embedding model** (MiniLM, an encoder). The answer is written by a **different model**, the LLM (a decoder). Only the chunk **text** moves between them.
+
+### 6.1 What the LLM receives
+
+The LLM is a **stateless function**: prompt in, text out. It doesn't create or keep context. On every request your app assembles one prompt:
 
 ```
-Build prompt:
-  "Answer ONLY from context:
-   {chunk1} {chunk2} {chunk3}
-   Question: {user's question}"
-        ↓
-Send to LLM (stream tokens back)
-        ↓
-Streaming answer → user
+[system instructions]     "Answer ONLY from context..."
+[retrieved chunks]        top-K chunk TEXT from Qdrant
+[chat history]            last N turns
+[new question]
+        ↓ one prompt (all tokens)
+   LLM → streamed answer
 ```
 
-Prompt template improvements (clear separation of instructions, context, history and question; "say you don't know" when the context is insufficient) are covered in [RAG_IMPROVEMENT_GUIDE.md](./RAG_IMPROVEMENT_GUIDE.md).
+- "Context" simply means this prompt. Nothing is stored in the model after the call, and its weights never change.
+- Chunks go in as **text**. The MiniLM vectors are only used to search Qdrant and never reach the LLM.
+- Prompt template improvements (clear separation of instructions, context, history and question; "say you don't know" when the context is insufficient) are covered in [RAG_IMPROVEMENT_GUIDE.md](./RAG_IMPROVEMENT_GUIDE.md).
+
+### 6.2 Context window and managing context
+
+The **context window** is the maximum number of tokens per request, input and output together. It depends on the model (about 8K for Llama 3 8B, 32K to 128K+ for newer models). Ollama often defaults to less than the model supports, so check `num_ctx`.
+
+Example budget for an 8K window:
+
+| Part | Tokens |
+|---|---|
+| System instructions | ~300 |
+| Top-5 chunks (5 × ~120) | ~600 |
+| History (last 10 turns) | ~2,000 |
+| New question | ~50 |
+| Room for the answer | ~1,000 |
+| **Used** | **~4K of 8K** |
+
+Your app manages it:
+- **New message:** it is appended to the history, the prompt is rebuilt, and retrieval runs again for the new question, so each turn gets fresh chunks.
+- **Over budget:** drop the oldest turns (a sliding window), summarize old turns, or lower K. Otherwise the provider errors or silently cuts the oldest tokens, so count tokens.
+- **Updated document:** re-embed and upsert into Qdrant (same `id` overwrites). The next retrieval returns the new text.
+- **New facts told in chat:** the model only "remembers" them while that message is still in the history window. To keep them longer, store them (Redis or a DB) and put them back into the prompt.
+
+### 6.3 What happens inside the LLM
+
+```
+prompt text (instructions + chunks + history + question)
+  │ the LLM's OWN tokenizer (own vocabulary, e.g. ~128K entries)  → token IDs   [~1,500]
+  │ the LLM's OWN embedding table + position                      → vectors     [1500, 4096]
+  │ 32 layers of: causal attention + feed-forward
+  ▼
+hidden vectors                                                                  [1500, 4096]
+  │ take ONLY the LAST token's vector (no pooling, no normalization)
+  │ output head: 4096 → vocabulary size (one score per possible next token, "logits")
+  │ softmax → a probability for every possible next token
+  │ pick one (temperature / top-p)                                → e.g. "Postgres"
+  ▼
+append the token to the sequence, repeat until the end token; stream each token to the user
+```
+
+- **Prefill:** the first pass processes all ~1,500 prompt tokens in parallel.
+- **Decode:** after that the model generates one token at a time, using the KV cache (6.6).
+- **How the chunks influence the answer:** each token being generated attends to the chunk tokens in the prompt. Nothing is learned or stored; the chunks only affect that one response.
+- The chunk text is tokenized a **second time** by the LLM's tokenizer. The two tokenizers read the same text, but their IDs and vectors are unrelated.
+
+### 6.4 Embedding model (encoder) vs LLM (decoder)
+
+| | Embedding model (MiniLM) | LLM (example: Llama 3 8B) |
+|---|---|---|
+| Type | Encoder | Decoder |
+| Job | Text → one vector for search | Prompt → next-token probabilities |
+| Tokenizer | WordPiece, 30,522 tokens | Its own, different vocabulary |
+| Embedding table | 30,522 × 384 | ~128K × 4096 |
+| Dimensions | 384 | 4096 |
+| Layers | 6 | 32 |
+| Attention | Bidirectional (every token sees all tokens) | Causal (a token sees only itself and earlier tokens) |
+| Output | Pooled + normalized vector | Probability for each possible next token |
+| Output head | No | Yes (vector → vocabulary scores) |
+| Parameters | ~22 million | ~8 billion |
+| Runs | Once per text | Prefill once, then once per generated token |
+| KV cache | No | Yes |
+
+Both models have a saved embedding table and frozen attention/feed-forward weights. The difference is architecture and use, not "one has saved data".
+
+### 6.5 Why the token limit exists: the attention math
+
+For one head in one layer, with `n` tokens and head size `d`:
+- Q, K, V are each `n × d` (one row per token).
+- Scores form an `n × n` grid, where entry `(i, j)` is how much token `i` looks at token `j` (one dot product of `d` numbers):
+
+$$S = \frac{QK^\top}{\sqrt{d}}$$
+
+- Number of scores: $n^2$. Multiply-adds: $n^2 \cdot d$. Softmax-weights times V adds another $n^2 \cdot d$.
+
+So the work is proportional to $n^2$: double the length and the work is 4×, 8× the length is 64×.
+
+| Tokens `n` | Scores per head per layer | × 32 heads × 32 layers (Llama 3 8B size) |
+|---|---|---|
+| 10 | 100 | 102,400 |
+| 1,000 | 1,000,000 | about 1 billion |
+| 8,000 | 64,000,000 | about 65 billion |
+
+- Cost is $n^2 \times \text{heads} \times \text{layers}$. For MiniLM, 10 tokens give 100 × 12 × 6 = 7,200 scores.
+- An LLM's causal attention roughly halves these numbers ($n(n+1)/2$, so 55 instead of 100 for 10 tokens), but the growth is still quadratic.
+- Storing the full `n × n` grid for 8,000 tokens is 64 million numbers per head. FlashAttention avoids storing it by working in blocks, but compute stays quadratic.
+- Meaning is not found in a single pass: each layer builds on the previous layer's output, so deeper layers combine more complex relationships.
+
+### 6.6 KV cache
+
+Every token, in every layer, produces three vectors:
+- **Q (query):** "what am I looking for?"
+- **K (key):** "what do I contain?"
+- **V (value):** "what do I contribute?"
+
+To generate the next token, the model needs **its own Q** plus the **K and V of all earlier tokens**. Earlier tokens' Q vectors were only needed for their own outputs, which are already done. So only K and V are worth keeping: that is the **KV cache**.
+
+```
+Cache already holds:   K = [k_the, k_river, k_bank]     V = [v_the, v_river, v_bank]
+
+New token "is":
+  compute only for "is":  q_is, k_is, v_is
+  scores  = q_is · [k_the, k_river, k_bank, k_is]        → 4 scores
+  weights = softmax(scores)
+  output  = Σ weight × [v_the, v_river, v_bank, v_is]
+  append:   K = [..., k_is]     V = [..., v_is]
+```
+
+Cost for a 1,000-token prompt and 200 generated tokens:
+
+| | Work per new token | Total for 200 tokens |
+|---|---|---|
+| Without cache | recompute all $(n+i)^2$ scores | about 243 million |
+| With cache | $n+i$ scores (one row) | about 220 thousand |
+
+That is roughly a 1,000× saving. The one-time prefill over the whole prompt is still quadratic.
+
+**Why cached K and V stay valid:** causal attention means token `i` only sees tokens up to `i`. Its vector in layer 1 depends only on those tokens, layer 2 depends on layer-1 vectors of the same tokens, and so on. Later tokens can never change it.
+
+**Position:** position is part of K, so the same word at another position has a different K. During generation each token's position never changes (new tokens are only appended), so the cache stays correct. If something is inserted or changed **earlier** in the prompt, everything after it must be recomputed. Servers that reuse the cache across requests (prefix caching) only help when the **start of the prompt is identical**. For RAG, put stable text (system instructions) first and variable text (chunks, question) last.
+
+**Not reused across texts:** the word `bank` in another sentence has a different K and V (different neighbours and position).
+
+**Memory cost:** the cache trades compute for memory. For a Llama 3 8B-style model (32 layers, 8 K/V heads, head size 128, 2 bytes each):
+
+$$2 \times 32 \times 8 \times 128 \times 2 \text{ bytes} = 128 \text{ KB per token}$$
+
+An 8,000-token context needs about 1 GB for the cache alone.
+
+**Embedding models don't use it:** an encoder processes the whole text in one pass (nothing to reuse), and its bidirectional attention means adding a token changes every other token's vector, so past values can't be frozen. K and V still exist inside the encoder, but only as throwaway intermediate values. KV cache is specific to autoregressive generation in decoder-style models (GPT, Llama, Mistral, and the decoder of models like T5 or Whisper).
+
+### 6.7 What is stored where
+
+| Kind | Example | Lifetime | Changes? |
+|---|---|---|---|
+| **Model weights** | Embedding table, Wq/Wk/Wv, feed-forward, output head | Permanent (learned in training) | Never during use |
+| **Runtime memory** | Activations, KV cache | One request or conversation, in GPU memory | Yes, grows with every token |
+| **Your data** | Chunk vectors and payloads in Qdrant | Until you delete them | Whenever you re-index |
+
+The LLM's weights never learn your documents. Your chunks reach it only as text in the prompt.
 
 ---
 
@@ -1046,6 +1274,18 @@ No. Three separate steps: pooling (average), normalization (scale one vector), s
 **"Does the model's output [1, 7, 384] equal the embedding?"**
 No. That is the token-level output. Pooling and normalization still have to be applied.
 
+**"Where is the position added, and is it the same as K?"**
+No. Position vectors are added to the token vectors before attention. Q, K and V are computed afterwards from those vectors.
+
+**"Does the LLM remember my chat or my documents?"**
+No. It is stateless. Your app rebuilds the prompt (instructions + chunks + history + question) on every request.
+
+**"Does the vector DB give vectors to the LLM?"**
+No. Search returns points; the chunk **text** from their payload goes into the prompt.
+
+**"Do both encoder and decoder have saved weights? Where is the KV cache?"**
+Both have frozen weights (embedding table, attention and feed-forward matrices). The KV cache is temporary runtime memory used only by decoders during generation.
+
 ---
 
 ## 10. Debug checklist
@@ -1088,6 +1328,9 @@ Without pooling, `output.data` is a flat array of all of them, which is meaningl
 7. **Per-user collections** give complete data isolation (at large scale use a shared collection with a `userId` filter).
 8. **Cosine similarity** is the standard choice for text search; on normalized vectors it equals the dot product and gives the same ranking as Euclidean.
 9. **Direction carries meaning, length doesn't.** That is why we normalize.
+10. **The embedding model and the LLM are different models.** Only chunk text moves between them; each uses its own tokenizer, weights and dimensions.
+11. **The LLM is stateless.** Your app rebuilds the prompt every request and must budget tokens (instructions + chunks + history + question + room for the answer).
+12. **Attention cost grows with the square of the length**, which is why context windows are limited. The KV cache saves recomputation during generation, at the cost of memory.
 
 ---
 
@@ -1095,7 +1338,7 @@ Without pooling, `output.data` is a flat array of all of them, which is meaningl
 
 - [ ] What do the numbers in a vector actually mean, and how does the model learn them?
 - [ ] What happens when text exceeds 256 tokens? (truncation behaviour, chunk size choice)
-- [ ] How does HNSW find nearest neighbours without checking every vector?
+- [x] How does HNSW find nearest neighbours without checking every vector? (see 5.6)
 
 ---
 
@@ -1121,3 +1364,11 @@ Without pooling, `output.data` is a flat array of all of them, which is meaningl
 | Payload | Data stored with a vector in Qdrant (chunk text, metadata) |
 | Chunk | A small focused piece of a document that gets its own vector |
 | Overlap | Characters shared between consecutive chunks |
+| Encoder | Transformer where every token sees all tokens (bidirectional); outputs vectors (MiniLM) |
+| Decoder | Transformer where a token sees only earlier tokens (causal); generates text (LLM) |
+| Context window | Maximum tokens per request, input and output together |
+| Prefill / decode | Processing the whole prompt in one pass / generating one token at a time |
+| Logits | One raw score per vocabulary token, turned into probabilities by softmax |
+| KV cache | Saved K and V of earlier tokens, reused while generating; temporary runtime memory |
+| Q, K, V | Query (what I look for), Key (what I contain), Value (what I contribute) |
+| ANN | Approximate nearest neighbour search (HNSW in Qdrant) |
