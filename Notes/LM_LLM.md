@@ -11,7 +11,8 @@ _The story in one chain: counting words (N-gram) → words as vectors (embedding
 4. [RNN](#4-rnn)
 5. [Transformers and how an LLM works](#5-transformers-and-how-an-llm-works)
 6. [What the weights are](#6-what-the-weights-are)
-7. [Link to RAG](#7-link-to-rag)
+7. [Running an LLM: formats, memory, speed and sizing](#7-running-an-llm-formats-memory-speed-and-sizing)
+8. [Link to RAG](#8-link-to-rag)
 
 ---
 
@@ -592,6 +593,8 @@ per token = 32 layers × 2 (K and V) × 8 K/V heads × 128 numbers × 2 bytes = 
 
 Only K and V are cached. Q is not, because it is only needed for the current token's own attention step. Embedding models like MiniLM have no cache.
 
+How this memory limits the context length on a real GPU, with formulas and a 4 GB example, is in section 7.
+
 ### 5.9 Full flow of an LLM: transformer and layers
 
 Llama-style decoder, with Llama 3 8B sizes:
@@ -661,7 +664,7 @@ An LLM has no separate memory drive. Its knowledge lives in the **weights and bi
 
 Analogy: grooves on a vinyl record. The grooves are the song (data) and also what produces the sound when the needle passes (calculation).
 
-This is "parametric" memory (in the weights, fixed after training). RAG adds "retrieved" memory: facts placed in the prompt at request time (section 7).
+This is "parametric" memory (in the weights, fixed after training). RAG adds "retrieved" memory: facts placed in the prompt at request time (section 8).
 
 ### 6.2 Weights vs biases
 
@@ -733,7 +736,7 @@ The parameter count is the total number of values across all weight matrices and
 | Final norm | | 4,096 |
 | **Total** | | **8,030,261,248** |
 
-The file you download is about 8 billion numbers (about 16 GB at 2 bytes each in fp16). Running the model means pushing your prompt vectors through those matrices.
+The file you download is about 8 billion numbers (about 16 GB at 2 bytes each in fp16). Running the model means pushing your prompt vectors through those matrices. How many bytes each number takes (fp16, 8-bit, 4-bit) and what that means for GPU memory is covered in section 7.
 
 ### 6.5 One layer, matrix by matrix
 
@@ -761,11 +764,259 @@ A layer contains **7 weight matrices**: 4 for attention and 3 for the MLP (plus 
 
 ---
 
-## 7. Link to RAG
+## 7. Running an LLM: formats, memory, speed and sizing
+
+_Sections 1 to 6 explained what the numbers are. This section explains what they cost to run: how many bytes the weights take, how big the KV cache gets, how fast the two phases run, and how to decide whether a model fits a given GPU._
+
+### 7.1 The context window has two limits
+
+The context window is the maximum number of tokens (prompt + answer) in one request. Two different things limit it:
+
+| Limit | Decided by | Can you change it? |
+|---|---|---|
+| **Model limit** | How the model was trained. Position information (RoPE in Llama) was only trained up to a length. Beyond it, quality drops sharply even if memory is free. The value is `max_position_embeddings` in the model config. | Only with extension methods (RoPE scaling, YaRN) that need tuning, and quality can suffer |
+| **Hardware limit** | GPU memory (weights + KV cache + buffers) and the time you accept (prefill grows with prompt length) | Yes: smaller model, quantization, quantized KV cache, more memory |
+
+$$n_{usable} = \min(n_{model},\ n_{memory},\ n_{time})$$
+
+Examples of the model limit: Llama 3 8B is trained for 8K, Llama 3.1 and 3.2 for 128K. A 128K model on a 4 GB GPU still only runs a small fraction of that (7.8).
+
+How each cost grows with the number of tokens `n`:
+
+| What | Grows with `n` as | Notes |
+|---|---|---|
+| Weights memory | Constant | Fixed by model size and number format |
+| KV cache memory | **Linear** | Per token, per layer, per K/V head (5.8) |
+| Prefill compute | Linear (projections + MLP) plus **quadratic** (attention scores) | Quadratic part: every token scores against every earlier token |
+| Decode compute per token | Linear | One row of scores against the cache |
+| Score grid memory (`n × n`) | Not stored | FlashAttention works in blocks, so memory stays linear. The compute is still quadratic |
+
+So "memory increases, compute decreases" is the KV cache trade: you store K and V for every token (memory grows linearly) so you never recompute them (a generated token costs `n` scores, not `n²`).
+
+### 7.2 Number formats: bits, bytes, fp16, 4-bit
+
+A model is a list of numbers (parameters). Memory = how many numbers × how much space each takes. A computer stores a number in **bits**, and 8 bits = 1 byte.
+
+| Format | Bits | Bytes per number | Notes |
+|---|---|---|---|
+| fp32 | 32 | 4 | Full precision. Usually only used during training |
+| **fp16** / bf16 | 16 | 2 | The usual released format |
+| int8 / Q8 | 8 | 1 (about 1.06 with scales) | Almost no quality loss |
+| **4-bit** (Q4) | 4 | 0.5 (about 0.56 to 0.6 with scales) | Small quality loss, 3 to 4× smaller than fp16 |
+
+**fp16** is a 16-bit floating-point number: 1 sign bit, 5 exponent bits (how big) and 10 mantissa bits (the digits). It keeps about 3 to 4 significant digits.
+
+```
+real weight stored in fp32:  0.123456789
+stored in fp16:              about 0.1235     (small rounding, harmless)
+```
+
+bf16 also uses 16 bits but has 8 exponent and 7 mantissa bits (wider range, fewer digits). Both take 2 bytes.
+
+**"2 bytes per weight" is not calculated.** It follows from the format: 16 bits ÷ 8 = 2 bytes. To find the format of a model you have:
+
+- the file name (`Q4_K_M` = 4-bit, `Q8_0` = 8-bit, `f16` = 16-bit),
+- `torch_dtype` in `config.json` (for example `bfloat16`),
+- or file size ÷ parameter count: 6.4 GB for a 3.2B model is 2 bytes per weight (fp16), 2 GB is about 0.6 bytes (4-bit).
+
+**What is decided when:**
+
+| Decided | When | Can it change later? |
+|---|---|---|
+| Parameter count, layers, heads, K/V heads, head size, hidden size | Before training (architecture) | No, that needs a new model |
+| Training precision (usually fp32 master weights, bf16 compute) | During training | Not relevant after training |
+| Format of the file you download (fp16, 8-bit, 4-bit) | After training | **Yes**: quantization converts the same model with no retraining |
+| Format of the KV cache (fp16 or 8-bit) | At runtime | Yes, it is a setting |
+
+### 7.3 Quantization: how 4-bit works
+
+**Quantization** stores each weight with fewer bits by rounding it to one of a small set of values. With 4 bits there are $2^4 = 16$ possible values (0 to 15).
+
+Weights are handled in small **blocks** (for example 32). Each block stores one **scale** and one **minimum** (in fp16), and each weight is stored as a 4-bit integer `q`:
+
+$$w \approx \text{min} + q \times \text{scale}$$
+
+Example block (shortened to 5 weights):
+
+```
+original weights: -0.30, -0.10, 0.05, 0.12, 0.45
+min = -0.30, max = 0.45
+scale = (max - min) / 15 = 0.75 / 15 = 0.05
+
+q = round((w - min) / scale)
+  -0.30 → 0     -0.10 → 4     0.05 → 7     0.12 → 8 (8.4 rounded)     0.45 → 15
+
+rebuilt: min + q × scale
+  -0.30,        -0.10,        0.05,        0.10 (was 0.12),           0.45
+```
+
+The rebuilt values are close but not exact (0.12 became 0.10). That rounding error is the small quality loss of 4-bit.
+
+- **Real size:** a block of 32 weights costs 32 × 4 bits = 16 bytes plus 2 to 4 bytes for scale (and min). In Q4_0 that is 18 bytes per 32 weights = 4.5 bits = 0.5625 bytes per weight. Q4_K_M averages about 4.8 bits, so **about 0.6 bytes per weight**.
+- **At run time** the GPU rebuilds fp16 values from `q`, `scale` and `min` on the fly and does the normal math. So quantization saves **memory and memory reads**, not arithmetic.
+- Quantizing the KV cache works the same way (8-bit halves it).
+
+Weight sizes (parameter counts are the real ones for the Llama 3 family):
+
+| Model | Parameters | fp16 (2 B) | 8-bit (about 1.06 B) | 4-bit (about 0.6 B) |
+|---|---|---|---|---|
+| Llama 3.2 1B | 1.24B | 2.5 GB | 1.3 GB | 0.8 GB |
+| Llama 3.2 3B | 3.21B | 6.4 GB | 3.4 GB | 2.0 GB |
+| Llama 3 8B | 8.03B | 16 GB | 8.5 GB | 4.9 GB |
+
+### 7.4 What sits in GPU memory
+
+$$\text{VRAM needed} = M_{weights} + M_{KV} + M_{overhead}$$
+
+| Part | What it is | Changes while running? |
+|---|---|---|
+| Weights | The trained matrices (7.3) | No |
+| KV cache | K and V of every token in the context, per layer and K/V head (5.8) | Yes, grows with every token. Many runtimes reserve it for the whole context length you configure |
+| Overhead | CUDA context, temporary buffers used during the math, the screen if the GPU drives your display | Roughly constant, about 0.5 to 1 GB |
+
+### 7.5 KV cache per token
+
+$$m_{kv} = 2 \times L \times H_{kv} \times d_{head} \times b_{kv}$$
+
+| Symbol | Meaning |
+|---|---|
+| 2 | One K and one V |
+| $L$ | Layers (each layer has its own cache) |
+| $H_{kv}$ | **K/V heads**, not query heads (grouped-query attention shares each K/V head between several query heads) |
+| $d_{head}$ | Numbers per head |
+| $b_{kv}$ | Bytes per number (2 for fp16, 1 for 8-bit) |
+
+Derivation for Llama 3.2 3B (28 layers, 8 K/V heads, head size 128, fp16):
+
+```
+K in one layer = 8 heads × 128 numbers = 1,024 numbers
+V in one layer = 1,024 numbers
+K + V in one layer = 2,048 numbers
+× 28 layers = 57,344 numbers
+× 2 bytes (fp16) = 114,688 bytes ≈ 112 KB per token
+```
+
+| Model | Layers | K/V heads | Head size | KV per token (fp16) | 8,000 tokens |
+|---|---|---|---|---|---|
+| Llama 3.2 1B | 16 | 8 | 64 | 32 KB | 0.26 GB |
+| Llama 3.2 3B | 28 | 8 | 128 | 112 KB | 0.92 GB |
+| Llama 3 8B | 32 | 8 | 128 | 128 KB | 1.05 GB |
+| Llama 3 8B without GQA (32 K/V heads) | 32 | 32 | 128 | 512 KB | 4.2 GB |
+
+The last row shows why GQA exists: 4× less cache and 4× less memory to read per generated token.
+
+- The cache grows **linearly** with tokens and is multiplied by the number of requests running at the same time.
+- It is reserved for the whole configured context (`num_ctx`), even before you type anything.
+
+### 7.6 Prefill and decode cost
+
+| | Prefill | Decode |
+|---|---|---|
+| What | Process the whole prompt in one pass | Generate the answer one token at a time |
+| Tokens per pass | All `n` prompt tokens in parallel | 1 |
+| Attention work | Quadratic in `n` | Linear in `n` (one row of scores using the cache) |
+| Limited by | **Compute** (FLOPs per second) | **Memory bandwidth** (bytes read per token) |
+| What you feel | Time to first token | Tokens per second |
+| Does quantization help? | Little (math is done in fp16) | Yes, a lot (fewer bytes to read) |
+
+**Prefill.** Each token passes through all weights, about 2 FLOPs per parameter, plus the attention scores. With causal attention:
+
+$$F_{prefill} \approx 2\,P\,n \;+\; 2\,n^2\,d_{model}\,L, \qquad T_{prefill} \approx \frac{F_{prefill}}{\text{FLOPS}_{eff}}$$
+
+The attention term comes from the two products $Q K^\top$ and weights × $V$: each costs $2\,n^2\,d_{model}$ per layer, so $4\,n^2\,d_{model}$ together, and the causal mask (a token only looks backwards) halves that to $2\,n^2\,d_{model}$. Example for Llama 3.2 3B ($P$ = 3.2 billion, $d_{model}$ = 3072, $L$ = 28) with an assumed 5 TFLOPS effective:
+
+| Prompt tokens | Linear part | Attention part | Total | Time |
+|---|---|---|---|---|
+| 2,000 | 12.8 TFLOPs | 0.7 TFLOPs | 13.5 TFLOPs | about 2.7 s |
+| 4,000 | 25.6 TFLOPs | 2.7 TFLOPs | 28.4 TFLOPs | about 5.7 s |
+| 12,000 | 76.8 TFLOPs | 24.8 TFLOPs | 101.6 TFLOPs | about 20 s |
+
+A 6× longer prompt costs about 7.5× more, and the gap widens as the prompt grows.
+
+**Decode.** To produce one token the GPU must read the whole weights and the whole KV cache from memory:
+
+$$\text{tokens/s} \approx \frac{BW}{M_{weights} + n \times m_{kv}}$$
+
+The arithmetic for one token is only about $2P$ = 6.4 GFLOPs (about 1 ms at 5 TFLOPS), but reading 2.5 GB at 100 GB/s takes about 25 ms. The GPU waits on memory, which is why decode is called **bandwidth-bound**. Example (assumed 100 GB/s effective, 3B model):
+
+| Setup | Bytes read per token | Speed |
+|---|---|---|
+| 4-bit weights (2.0 GB), 4,000 tokens of context | 2.0 + 0.46 = 2.46 GB | about 40 tok/s |
+| 4-bit weights, 12,000 tokens | 2.0 + 1.38 = 3.38 GB | about 30 tok/s |
+| 4-bit weights, 12,000 tokens, 8-bit KV cache | 2.0 + 0.69 = 2.69 GB | about 37 tok/s |
+| fp16 weights (6.4 GB), 4,000 tokens (does not fit in 4 GB, for comparison) | 6.4 + 0.46 = 6.86 GB | about 15 tok/s |
+
+With several requests at once, the weights are read once per step for all of them, so total throughput rises while each request's KV cache still has to be read.
+
+### 7.7 Sizing formulas
+
+| What to find | Formula |
+|---|---|
+| Weights memory | $M_w = P \times b_w$ |
+| KV cache per token | $m_{kv} = 2 \times L \times H_{kv} \times d_{head} \times b_{kv}$ |
+| KV cache total | $M_{kv} = n \times m_{kv} \times S$ ($S$ = requests at the same time) |
+| Does it fit? | $M_w + M_{kv} + M_{overhead} \le \text{VRAM}$ |
+| Max tokens in memory | $n_{max} = \dfrac{\text{VRAM} - M_w - M_{overhead}}{m_{kv} \times S}$ |
+| Usable context | $\min(n_{model},\ n_{max})$, then set `num_ctx` to it |
+| Time to first token | $T_{prefill} \approx \dfrac{2\,P\,n + 2\,n^2\,d_{model}\,L}{\text{FLOPS}_{eff}}$ |
+| Generation speed | $\text{tok/s} \approx \dfrac{BW}{M_w + n \times m_{kv}}$ |
+| Total answer time | $T \approx T_{prefill} + \dfrac{n_{out}}{\text{tok/s}}$ |
+
+These are estimates: real speeds are below the peak numbers (use the GPU's memory bandwidth for $BW$ and measure real tokens per second).
+
+### 7.8 Worked example: a 4 GB GPU
+
+Assumptions: 4 GB of GPU memory, about 100 GB/s effective bandwidth, about 5 TFLOPS effective. Model: Llama 3.2 3B in 4-bit (about 2.0 GB), fp16 KV cache.
+
+```
+Step 1  Does the model fit?        weights 2.0 GB < 4 GB                 yes
+Step 2  KV cache per token         2 × 28 × 8 × 128 × 2 = 114,688 B      about 112 KB
+Step 3  Memory left for KV         4.0 - 2.0 (weights) - 0.7 (overhead)   = 1.3 GB
+Step 4  Max tokens                 1.3 GB / 112 KB                        about 11,000 to 12,000
+Step 5  Pick a safe context        8,192 (leave headroom)                 KV about 0.9 GB
+Step 6  Speed at 4K prompt         prefill about 5.7 s, decode about 40 tok/s
+```
+
+Variations on the same 4 GB:
+
+| Change | Effect |
+|---|---|
+| 3B in fp16 (6.4 GB) | Does not fit |
+| 8B in 4-bit (4.9 GB) | Does not fit entirely. Layers spill to the CPU, which is several times slower |
+| 1B in 4-bit (0.8 GB, 32 KB per token) | About 2.5 GB left, so roughly 76,000 tokens (the model's own limit is 128K) |
+| 3B with an 8-bit KV cache (56 KB per token) | About 2× the tokens, roughly 22,000 to 24,000 |
+| Two users at the same time | The cache is split, so about 5,500 to 6,000 tokens each |
+
+**What to check, in order:**
+
+1. Model's trained context (`max_position_embeddings`).
+2. Weights size at your quantization (parameters × bytes per weight) must be below VRAM with room left.
+3. KV cache per token from the config (layers, K/V heads, head size).
+4. Free VRAM = total - weights - overhead (and subtract what the OS and display use).
+5. Max tokens = free VRAM ÷ (KV per token × concurrent requests).
+6. Time to first token for your typical prompt, and tokens per second at your typical context.
+7. Runtime settings: set the context length explicitly (`num_ctx` in Ollama), enable flash attention, choose the KV cache format, check how many layers are on the GPU.
+8. Prompt budget: instructions + chunks + history + question + room for the answer must fit in the context you chose.
+
+### 7.9 Common mix-ups
+
+| Mix-up | Correct |
+|---|---|
+| "The context limit is just the GPU's compute" | Two limits: the trained length of the model, and what fits in memory and time |
+| "Memory grows quadratically with context" | KV cache grows **linearly**. The `n × n` score grid is never stored with FlashAttention. Only compute is quadratic, and mainly in prefill |
+| "Compute cost = n × n × layers × heads" | Add the head size: $n^2 \times d_{head} \times \text{heads} \times \text{layers}$. Decode is linear per token, not quadratic |
+| "KV memory = layers × heads × K/V heads × size" | Only **K/V heads**: $2 \times L \times H_{kv} \times d_{head} \times \text{bytes}$ |
+| "2 bytes per weight is fixed by the design" | It is the number format. The architecture fixes the parameter count, not the bytes per parameter |
+| "Quantization makes everything faster" | It cuts memory and decode time. Prefill is compute-bound and barely changes |
+| "A 128K model can use 128K context on any GPU" | Only if the weights and the KV cache fit. On 4 GB it is a small fraction of that |
+
+---
+
+## 8. Link to RAG
 
 - The LLM is a **decoder** (causal attention, next-token output, KV cache). The embedding model used for RAG search is an **encoder** (every token sees all tokens, outputs one vector). Both have trained, frozen weights including Wq, Wk, Wv.
 - Retrieved chunks reach the LLM only as **text in the prompt**; they are not stored in its weights.
-- Details: [RAG_COMPLETE_GUIDE.md](./RAG_COMPLETE_GUIDE.md), sections 3 and 6.
+- Details: [RAG_COMPLETE_GUIDE.md](./RAG_COMPLETE_GUIDE.md), sections 3 and 6. Sizing the LLM for a RAG system (memory, speed, formulas) is in section 16 of that guide.
 
 
 

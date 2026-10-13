@@ -23,6 +23,10 @@ _The complete RAG learning guide in one document. It follows the order the data 
 10. [Debug checklist](#10-debug-checklist)
 11. [Key takeaways](#11-key-takeaways)
 12. [Open questions](#12-open-questions)
+13. [Limits cheat sheet](#13-limits-cheat-sheet)
+14. [Advanced RAG: beyond naive retrieval](#14-advanced-rag-beyond-naive-retrieval)
+15. [RAG design checklist: decisions and parameters](#15-rag-design-checklist-decisions-and-parameters)
+16. [Sizing the LLM system: formulas and worked example](#16-sizing-the-llm-system-formulas-and-worked-example)
 - [Appendix A: Glossary](#appendix-a-glossary)
 
 ---
@@ -500,7 +504,7 @@ Same starting vector `[0.5, 0.5]`, different result depending on the neighbours.
 
 **Multi-head:** the model does this several times in parallel. MiniLM-L6 uses 12 heads of 32 numbers each (12 × 32 = 384). Each head can focus on a different kind of relationship (neighbouring words, which noun an adjective describes). The results are joined back into 384 numbers.
 
-Every token looks at every other token, so the attention work grows with the **square** of the text length (7 tokens = 49 scores per head, 100 tokens = 10,000). At MiniLM's lengths the matrix multiplications still dominate the total cost (see 2e), but the model is trained and configured for at most 256 tokens, so longer text is truncated.
+Every token looks at every other token, so the attention work grows with the **square** of the text length (7 tokens = 49 scores per head, 100 tokens = 10,000). At MiniLM's lengths the matrix multiplications still dominate the total cost (see 2e), but the model is trained and configured for at most 256 tokens, so longer text is truncated. **Attention:** the dropped tokens never influence the vector, which can make relevant chunks unfindable (see 7.2).
 
 #### 2c.1 Heads: what, why and how
 
@@ -650,13 +654,33 @@ If sentences have different lengths, shorter ones are padded and the attention m
 
 ```
 Token IDs        [101, ..., 102]        just row numbers
-   ↓ lookup
+   ↓ lookup (token table)
 Token vectors    [1, 7, 384]            each token alone, same vector in every sentence
-   ↓ + position
-                 [1, 7, 384]            knows its place in the sentence
-   ↓ attention + feed-forward (×6)
+   ↓ + position vectors (+ type vector), LayerNorm
+X                [1, 7, 384]            knows its place in the sentence
+
+   ↓ repeated for each of the 6 layers (each layer has its own weights):
+   │  ATTENTION
+   │   1. Q = X·Wq,  K = X·Wk,  V = X·Wv           each [7, 384]
+   │   2. split into 12 heads of 32 numbers         each [12, 7, 32]
+   │   3. in every head (the same formula, different weights):
+   │        scores  = Q·Kᵀ / √32                    [12, 7, 7]
+   │        + padding mask, softmax per row         weights, each row sums to 1
+   │        context = weights · V                   [12, 7, 32]
+   │   4. concatenate the 12 heads                  [7, 384]
+   │   5. · Wo (mixes the heads together)           [7, 384]
+   │   6. residual add (+ X) and LayerNorm          [7, 384]
+   │  FEED-FORWARD
+   │   7. 384 → 1536 → 384 (GELU), residual add, LayerNorm   [7, 384]
+   ▼
 Contextual       [1, 7, 384]            each token's vector reflects the whole sentence
 ```
+
+- **Q, K, V are the core of attention.** Each token's vector is turned into a Query (what it is looking for), a Key (what it contains) and a Value (what it contributes). Q·K gives the scores, softmax turns them into weights, and the weights blend the Values into the token's new vector.
+- **Heads:** MiniLM splits Q, K and V into **12 heads of 32 numbers**. A head is one small function (the formula in step 3) with its own slices of Wq, Wk and Wv. The 12 heads run in parallel, look at the text in different ways, and are joined and mixed by Wo (details in 2c.1).
+- **What is stored and what is temporary:** Wq, Wk, Wv, Wo and the feed-forward matrices are trained weights stored in the model. Q, K, V, scores and weights are computed per input and discarded (details in 2f).
+- **Order:** the 12 heads of a layer run together, but the 6 layers run one after another because each needs the previous layer's output.
+- **Cost:** per layer this is Q, K, V and Wo projections, the n × n scores, and the feed-forward network (details in 2e).
 
 The model's raw output is these token-level vectors (the last hidden state), **not** the final embedding. Pooling and normalization still have to be applied.
 
@@ -687,23 +711,52 @@ river = [1.0, 0.0]      money = [0.0, 1.0]      bank = [0.5, 0.5]
 
 **Stage 3: attention** for the token `bank` (x2) in `river bank`
 
+**Goal:** let `bank` read from `river` (and from itself) so its vector gets context. In this toy, a token's Query, Key and Value are all just its vector; a real model computes them with Wq, Wk and Wv.
+
 ```
-a) score against each token (dot product; a vector is also compared with itself)
+Who is asking:        bank   (its Query = [0.7, 0.7])
+Who it can look at:   river  (Key = Value = [1.1, 0.1])
+                      bank   (Key = Value = [0.7, 0.7])   ← itself, so it keeps part of its own meaning
+```
+
+```
+a) SCORE: how well does bank's Query match each Key?   (dot product)
      with river: 0.7×1.1 + 0.7×0.1 = 0.84
      with bank:  0.7×0.7 + 0.7×0.7 = 0.98
+   → a higher score means "more relevant to me"
 
-b) divide by √d (d = head size; the toy has √2 ≈ 1.41, MiniLM's heads have d = 32 so √32 ≈ 5.66; keeps scores from growing too large)
+b) SCALE: divide by √d so the scores don't grow too large
+     (d = head size; the toy has √2 ≈ 1.41, MiniLM's heads have d = 32 so √32 ≈ 5.66)
      0.84 / 1.41 = 0.59        0.98 / 1.41 = 0.69
 
-c) softmax → weights that sum to 1
+c) SOFTMAX: turn the scores into reading percentages that sum to 1
      e^0.59 = 1.81,  e^0.69 = 2.00,  sum = 3.81
      weights = [1.81/3.81, 2.00/3.81] = [0.475, 0.525]
+   → read 47.5% from river and 52.5% from bank itself
 
-d) new vector = weighted sum of the token vectors
+d) BLEND: take that much of each token's Value
      0.475 × [1.1, 0.1] + 0.525 × [0.7, 0.7]
    = [0.5225 + 0.3675,  0.0475 + 0.3675]
    = [0.89, 0.415]            ← leans "nature"
 ```
+
+In one picture:
+
+```
+new bank = 47.5% of river's Value  +  52.5% of bank's own Value
+         = 0.475 × [1.1, 0.1]      +  0.525 × [0.7, 0.7]
+         = [0.89, 0.415]
+
+           nature  finance
+before:     0.70     0.70     ← ambiguous
+after:      0.89     0.415    ← river pulled it towards "nature"
+```
+
+What to notice:
+- The first number went up (0.70 → 0.89) and the second down (0.70 → 0.415): `river` pushed `bank` towards "nature".
+- The weights here are close to 50/50 only because the toy numbers are simple. In a real model the weights are learned and can be very uneven.
+- Keys and Queries decide *how much* to read (the weights). The Values decide *what* is read.
+- `river` does the same thing to itself, shown below, and so does every other token.
 
 For `money bank` the scores are identical (0.84 and 0.98), but the other word is different:
 
@@ -1051,16 +1104,78 @@ Layer 1:   A ─────── C ───────── F ──── 
 Layer 0:   A B C D E F G H I J ...              every vector, short links to near neighbours
 ```
 
-Search:
-1. Start at an entry node in the top layer.
-2. Greedily move to the neighbour closest to the query until no neighbour is closer.
-3. Drop to the next layer and continue from that node.
-4. On layer 0, explore a small candidate list, keep the best K.
+How the layers are built: every vector is stored on layer 0. Each vector is also given a random top layer, with each higher layer being exponentially rarer, so only a few vectors reach the top. A vector is linked to its nearest neighbours on every layer from its top layer down to 0 (up to `m` links per layer, `2m` on layer 0).
 
-It visits only a tiny fraction of the vectors (cost grows roughly with the logarithm of n), which is how millions of vectors are searched in milliseconds.
+```
+Layer 2   [ few landmark vectors ]            long jumps        → find the right REGION
+Layer 1   [ more vectors ]                    medium jumps      → narrow it down
+Layer 0   [ ALL vectors ]                     short links       → find the exact top K
+```
 
-- **Approximate:** it can miss a true nearest neighbour. The trade-off is tunable: `m` (links per node) and `ef_construct` (build effort) when creating the collection, `hnsw_ef` (search effort) at query time. Higher values give better recall but slower search.
-- **Where cosine fits:** every "which neighbour is closer to the query?" decision inside HNSW uses the collection's metric. With normalized vectors that is a plain dot product. ANN is the method, cosine is the measure.
+#### The search, step by step
+
+Every "score" below is the collection's metric between the **query vector** and a stored vector. With normalized vectors that is one dot product of 384 numbers.
+
+**1. Top layer: greedy walk.**
+- Start at a fixed entry node on the highest layer. Compute its score with the query.
+- Compute the scores of its linked neighbours. If a neighbour scores **higher**, move to it and repeat.
+- When no neighbour scores higher than the current node, stop walking on this layer.
+
+**2. Drop down.** Take that best node as the starting point on the next layer down. It has more nodes and shorter links, so it refines the position. Repeat the same walk (move while a neighbour scores higher). Upper layers only follow the single best node (`ef = 1`), because they are just for getting close.
+
+**3. Layer 0: a wider search.** All vectors are here. Instead of one best node, keep:
+- a **result list** of the best `ef` vectors seen so far (the `hnsw_ef` setting, at least the requested `limit`), and
+- a **candidate queue** of nodes still to explore, best first.
+
+Repeat: take the best unexplored candidate, score its neighbours, and put any that beat the worst item in the result list into the result list (the worst is kicked out). Stop when the best unexplored candidate scores **worse than the worst item in the result list**, because exploring further can't improve the list.
+
+**4. Return** the best `limit` (K) items of the result list, with their scores and payloads.
+
+Toy example (query = `[1.0, 0.0]`, scores are dot products, higher is better):
+
+```
+Layer 2:  start A (0.20) → neighbour F (0.65) is higher → move to F
+          F's neighbours: A (0.20)                    → none higher, stop at F       [2 scores]
+Layer 1:  start F (0.65) → neighbours C (0.55), H (0.90) → move to H
+          H's neighbours: F (0.65)                    → none higher, stop at H       [3 scores]
+Layer 0:  start H (0.90) → neighbours G (0.93), I (0.95), J (0.70)
+          explore I → K (0.97), J (already seen) ...
+          result list (ef) keeps the best: K 0.97, I 0.95, G 0.93, H 0.90 ...
+          best unexplored candidate (0.70) < worst in the list (0.90) → stop
+          return the top K, for example K = 3: K, I, G                              [about 10 scores]
+```
+
+About 15 comparisons instead of one per stored vector. On a real collection with millions of vectors, a search typically scores only a few hundred vectors.
+
+| | Top layers | Layer 0 |
+|---|---|---|
+| Vectors on it | Very few (landmarks) | All of them |
+| Links | Long, between far-apart vectors | Short, to near neighbours |
+| Goal | Reach the right neighbourhood quickly | Find the exact best K there |
+| Search width | Follow one best node | Keep `ef` candidates |
+| Skips | Almost the whole database | Everything outside the neighbourhood |
+
+Cost grows roughly with the logarithm of the number of vectors, so searches usually take milliseconds. The exact time depends on collection size, hardware, `hnsw_ef` and filters.
+
+#### Approximate, and the three knobs
+
+HNSW can miss a true nearest neighbour (for example the walk gets stuck in a local neighbourhood). The fraction of true nearest neighbours it returns is called **recall**. `ef` stands for "exploration factor", the number of candidates kept while exploring. Three settings trade recall against speed and memory:
+
+- **`m`:** how many neighbours each vector is linked to (roads leaving each town).
+- **`ef_construct`:** how many candidates are examined while *building* the graph, when a new vector picks its links (how carefully the roads are planned). It does not change search speed later.
+- **`hnsw_ef`:** how many candidates are kept while *searching* (how many routes you try before answering). If a request doesn't set it, Qdrant uses the collection's `ef_construct`.
+
+| Setting | When | Meaning | Higher value means |
+|---|---|---|---|
+| `m` (default 16) | Collection creation | Links per node | Better recall, more RAM (the graph costs roughly 100+ bytes per vector at `m = 16`, on top of the 1,536 bytes of the vector itself), slower build |
+| `ef_construct` (default 100) | Collection creation | How many candidates are considered when linking a new vector | Better graph quality, slower indexing |
+| `hnsw_ef` | Each search request | The `ef` of step 3: size of the result list and candidate search | Better recall, slower search |
+
+Rule of thumb: raise `hnsw_ef` first if recall is poor (no re-indexing needed), and raise `m` and `ef_construct` only if that is not enough.
+
+- **Per segment:** Qdrant builds one graph per segment, searches each, and merges the results. Small segments (below the indexing threshold) and very selective filters are scanned exactly instead (14.1).
+- **Filters:** a payload filter is applied during the walk (only matching nodes can enter the result list), so you still get K matching results.
+- **Where cosine fits:** every "which neighbour scores higher?" decision inside HNSW uses the collection's metric. With normalized vectors that is a plain dot product. ANN is the method, cosine is the measure.
 
 ---
 
@@ -1209,7 +1324,7 @@ That is roughly a 1,000× saving. The one-time prefill over the whole prompt is 
 
 $$2 \times 32 \times 8 \times 128 \times 2 \text{ bytes} = 128 \text{ KB per token}$$
 
-An 8,000-token context needs about 1 GB for the cache alone.
+An 8,000-token context needs about 1 GB for the cache alone. Section 16 turns this into a sizing formula for a given GPU.
 
 **Embedding models don't use it:** an encoder processes the whole text in one pass (nothing to reuse), and its bidirectional attention means adding a token changes every other token's vector, so past values can't be frozen. K and V still exist inside the encoder, but only as throwaway intermediate values. KV cache is specific to autoregressive generation in decoder-style models (GPT, Llama, Mistral, and the decoder of models like T5 or Whisper).
 
@@ -1272,6 +1387,13 @@ The Qdrant collection dimension must match the model's output, but it has **noth
 ```
 
 Our 500-char chunks produce about 80 to 120 tokens, safely within the limit.
+
+> **ATTENTION: tokens past the limit are ignored, and retrieval suffers.**
+> - The tokenizer cuts the input at 256 tokens (including `[CLS]` and `[SEP]`). The model never sees the rest, so those tokens do not affect the chunk's vector. No error or warning is raised.
+> - The vector then represents only the first part of the chunk. If the answer is in the dropped part, a question about it scores low and the chunk is **not retrieved**, even though its full text is stored in the Qdrant payload.
+> - Example: a 400-token chunk `[A: Node.js experience | B: AWS certifications]` where B is past token 256. The question "Does he have AWS certifications?" finds nothing, because the vector knows nothing about B.
+> - It can happen with 500-char chunks too: numbers, symbols, code and non-English text turn into many tokens per character (500 characters can reach 200 or more tokens).
+> - **Prevention:** keep chunks at about 150 to 200 tokens (500 to 800 characters), count tokens with the model's tokenizer when chunking and split anything over the limit, and log a warning when a chunk exceeds 256 tokens. For longer chunks use a model with a larger limit and match the Qdrant `size`.
 
 ### 7.3 How chunk size shapes accuracy
 
@@ -1531,7 +1653,7 @@ Without pooling, `output.data` is a flat array of all of them, which is meaningl
 3. **Always use mean pooling + normalization** for sentence embeddings (and use the attention mask when pooling).
 4. **Chunk size is a trade-off:** too small loses context, too large dilutes relevance.
 5. **Overlap prevents information loss** at chunk boundaries (20% is a good default).
-6. **Chunk size and dimensions are independent:** chunk size is your choice, dimensions are fixed by the model. The token limit (256) matters, not the character count.
+6. **Chunk size and dimensions are independent:** chunk size is your choice, dimensions are fixed by the model. The token limit (256) matters, not the character count. Tokens past it are silently ignored, so the vector can miss information in the cut-off part of a chunk (7.2).
 7. **Per-user collections** give complete data isolation (at large scale use a shared collection with a `userId` filter).
 8. **Cosine similarity** is the standard choice for text search; on normalized vectors it equals the dot product and gives the same ranking as Euclidean.
 9. **Direction carries meaning, length doesn't.** That is why we normalize.
@@ -1546,6 +1668,740 @@ Without pooling, `output.data` is a flat array of all of them, which is meaningl
 - [ ] What do the numbers in a vector actually mean, and how does the model learn them?
 - [ ] What happens when text exceeds 256 tokens? (truncation behaviour, chunk size choice)
 - [x] How does HNSW find nearest neighbours without checking every vector? (see 5.6)
+
+---
+
+## 13. Limits cheat sheet
+
+Every stage has its own limit. The smallest one along the path is what breaks first.
+
+```
+file upload → chunks → EMBEDDING MODEL → vector → QDRANT API (put) → stored
+question    → EMBEDDING MODEL → vector → QDRANT API (search/get) → top-K → LLM prompt → answer
+               limit 1                      limit 2                        limit 3
+```
+
+### 13.1 Embedding model (`all-MiniLM-L6-v2`)
+
+| Limit | Value | What happens when exceeded |
+|---|---|---|
+| Max input | 256 tokens (about 1,000 to 1,200 chars) | Silently truncated, the rest is lost (7.2) |
+| Position table | 512 rows (hard architecture cap) | Never usable beyond 512, even if the 256 cap is removed |
+| Output size | 384 numbers, fixed | Must match the Qdrant collection `size` |
+| Cost | n² attention, linear part dominates below about 2,300 tokens (2e) | Slower, but not a problem at 256 |
+| Throughput | Runs on your CPU (ONNX), one process | Slow for many chunks; use batches and the worker pool |
+
+Our 500-char chunks are about 80 to 120 tokens, so they fit.
+
+### 13.2 Qdrant: what one stored item (point) can hold
+
+A point is `{ id, vector(s), payload }`.
+
+| Part | Limit | Notes |
+|---|---|---|
+| `id` | Unsigned 64-bit integer **or** UUID | Nothing else (no free strings). Same id again overwrites |
+| Vector size | Fixed per collection; must equal the model output (384). The documented maximum is 65,536 dimensions | Wrong size → `Vector dimension error` |
+| Vector values | float32 by default (4 bytes each) | 384 × 4 = 1,536 bytes per vector |
+| Vectors per point | One default vector, or several **named** vectors (each with its own size and distance) | Fixed when the collection is created |
+| Payload | Any JSON (text, numbers, arrays, nested objects) | No fixed per-point cap. The practical cap is the request size (13.3) and RAM/disk |
+| Payload types for filters | keyword, integer, float, bool, geo, datetime, text, uuid | Create a payload index for fields you filter on |
+
+Our point: 1,536 bytes of vector plus about 0.5 to 1 KB of payload text, so roughly 2.5 KB per chunk on disk, and 3 to 5 KB as JSON in the request.
+
+### 13.3 Qdrant API limits (PUT / upsert, GET / retrieve, search)
+
+Values are the **defaults in Qdrant's `config.yaml`** and are configurable on self-hosted. On Qdrant Cloud the plan decides.
+
+| Limit | Default | Applies to |
+|---|---|---|
+| `service.max_request_size_mb` | **32 MB** per POST/PUT body | One upsert request. Bigger → request rejected |
+| `max_workers` | CPU cores - 1 (min 1) | Concurrent API requests served |
+| `max_search_threads` | Auto (CPU based) | Parallel search work |
+| HTTP client request timeout | 5 s to read a request body | Slow or huge uploads can time out |
+| Search `timeout` parameter | None unless you set it | Per-request cap for a search |
+| `max_collections` | **No limit** (`null`) | Limited by RAM, since each collection has its own segments and index |
+| Built-in request rate limit | **None** on self-hosted | Only a distributed-mode update limit; Cloud plans may throttle |
+| Strict mode (optional, off by default) | `max_query_limit`, `max_timeout`, `search_max_hnsw_ef`, `search_allow_exact` | Lets you cap `limit`, timeout and `hnsw_ef` per collection |
+| Memory/disk quotas (optional) | `max_resident_memory_percent`, `max_disk_usage_percent` | Updates are rejected once reached |
+
+**Upsert (PUT) in practice**
+- **How many points per request?** The body must stay below 32 MB. At about 4 KB per point as JSON that is a ceiling of about 8,000 points, but send **100 to 500 per batch**: smaller requests, easier retries, steady memory.
+- **Client limit:** axios on Node limits the request body to about **10 MB** by default (`maxBodyLength`). That is hit before the Qdrant limit. Another reason to keep batches small.
+- **`wait` parameter** (`PUT /collections/{name}/points?wait=true`): `true` returns after the data is applied and searchable; `false` returns as soon as it is written to the WAL, which is faster, but a search right after may not see the points. Use `true` when the next step reads the data.
+- **Indexing is asynchronous:** a fresh point is searchable immediately (brute force on small unindexed segments), but its place in the HNSW graph is built in the background, after a segment passes `indexing_threshold_kb` (10 MB by default).
+- **Idempotent:** the same `id` is overwritten, so a failed batch can simply be retried.
+
+**Search and retrieve (GET side) in practice**
+
+| Operation | Limit |
+|---|---|
+| Search / query: `limit` | Default 10. No hard maximum unless strict mode sets `max_query_limit`. A huge `limit` costs time and response size |
+| Search `offset` | Works, but cost grows with `limit + offset`. Use scroll for deep paging |
+| Scroll (`/points/scroll`) | Pages through points with a cursor (`next_page_offset`); default page size 10 |
+| Retrieve by ids (`/points`) | No fixed count. Bounded by request size (32 MB) and your timeout |
+| Batch search / query | Several searches in one request; bounded by request size |
+| Response size | `with_vectors: false` (default) keeps responses small. `with_vectors: true` adds 1.5 KB per hit |
+| Latency | HNSW is milliseconds for millions of vectors; filters on unindexed payload fields force slower scans |
+
+In our app the search request only sends one 384-number query vector (about 4 KB) and asks for 3 to 5 hits, so the API limits are never a problem. They matter for **bulk upload**.
+
+### 13.4 Qdrant capacity: how much can it store?
+
+The limit is the machine, not a Qdrant setting.
+
+**RAM rule of thumb** (from Qdrant's docs) for vectors kept in memory:
+
+$$\text{memory} \approx \text{vectors} \times \text{dimensions} \times 4 \text{ bytes} \times 1.5$$
+
+The 1.5 covers the HNSW graph and other overhead. For 384 dimensions:
+
+| Chunks stored | Raw vectors (1,536 B each) | With overhead (×1.5) |
+|---|---|---|
+| 10,000 | 15 MB | about 23 MB |
+| 100,000 | 154 MB | about 230 MB |
+| 1,000,000 | 1.5 GB | about 2.3 GB |
+| 10,000,000 | 15 GB | about 23 GB |
+
+Payload text is extra (1M chunks × 0.7 KB ≈ 0.7 GB), but by default it lives **on disk**, not in RAM. Indexed payload fields stay in RAM.
+
+**Ways to store more with less RAM:**
+
+| Option | Effect |
+|---|---|
+| Scalar quantization (float32 → int8) | About 4× less vector memory, small accuracy loss |
+| Binary quantization | Up to about 32× less, larger accuracy loss (best for high dimensions) |
+| Vectors and HNSW on disk (`on_disk`, mmap) | Slower search, but fits far more than RAM |
+| Smaller `m` for HNSW | Smaller graph, lower recall |
+| Sharding and replication (distributed mode) | Spreads data over several nodes |
+| Qdrant Cloud | Limits set by the cluster size you pick (the free tier is small) |
+
+**One collection per user** (what the app does): there is no collection-count limit, but every collection costs fixed memory and file handles. Thousands of tiny collections are much heavier than one shared collection with a `userId` filter.
+
+### 13.5 LLM limits
+
+| Limit | Typical value | What happens when exceeded |
+|---|---|---|
+| Context window | 8K (Llama 3 8B), 32K to 128K+ (newer) | Error, or the oldest tokens are cut (6.2) |
+| Ollama default `num_ctx` | A few thousand tokens, **lower than the model supports** | Prompt silently truncated; set it explicitly |
+| Max output tokens | Set per request (`max_tokens` / `num_predict`) | Answer stops mid-sentence |
+| KV cache memory | 128 KB per token for Llama 3 8B, so about 1 GB at 8K (6.6, 16) | Out-of-memory on the GPU or machine |
+| Speed | Prefill is parallel; decode is one token at a time | Long prompts → slow first token |
+| Hosted API rate limits | Requests per minute and tokens per minute, by plan | HTTP 429, retry with backoff |
+| Quality | "Lost in the middle": facts buried in the middle of a long prompt are used less | Wrong or missed answers even inside the window |
+
+**Prompt budget check:** system instructions + top-K × chunk tokens + history + question + room for the answer must be at most the context window.
+
+```
+Example: K = 5 chunks × 120 tokens = 600, history 2,000, instructions 300, question 50, answer 1,000
+         → about 4K, fine for 8K. With K = 20 and 500-token chunks: 10,000 tokens for the chunks alone → overflow.
+```
+
+### 13.6 App-level limits to set yourself
+
+| What | Suggested rule |
+|---|---|
+| Upload file size and page count | Cap it (for example a max MB and pages), reject early |
+| Chunks per upload | Cap it, since each chunk costs embedding CPU time plus 1.5 KB of RAM |
+| Embedding batch size | 16 to 64 chunks per call |
+| Upsert batch size | 100 to 500 points, with retry on failure (the upsert is idempotent) |
+| Top-K | 3 to 5, and check that K × chunk size fits the context window |
+| `score_threshold` | About 0.3 to 0.5 to drop weak matches |
+| Chat history | Sliding window or summary, never unbounded |
+| Per-user quotas | Limit stored chunks, uploads per day and questions per minute |
+
+### 13.7 Quick "what breaks first" table
+
+| Symptom | Limit hit |
+|---|---|
+| Answer ignores the end of a long chunk | Embedding model 256 tokens |
+| `expected dim: 384, got ...` | Vector size mismatch |
+| Upload fails with 413 or a body-too-large error | Request size (32 MB in Qdrant, about 10 MB in axios): send smaller batches |
+| Upsert succeeded but search does not find it yet | `wait=false`, or indexing still running |
+| Qdrant is slow or killed by the OS | Not enough RAM: use quantization or on-disk vectors |
+| LLM answer ignores the chunks | Prompt exceeded `num_ctx` and the start was cut, or the chunks sit in the middle of a long prompt |
+| HTTP 429 from an LLM API | Rate limit: back off and retry |
+
+---
+
+## 14. Advanced RAG: beyond naive retrieval
+
+Sections 1 to 13 describe **naive RAG**: embed the question, take the top-K chunks by cosine, paste them into the prompt. It works for simple questions and fails in predictable ways. Advanced RAG adds steps **before** retrieval, **during** retrieval and **after** retrieval, plus a way to **measure** whether any of it helps.
+
+### 14.0 Naive vs advanced RAG
+
+| Stage | Naive RAG (our app today) | Advanced RAG |
+|---|---|---|
+| Before retrieval | The question is embedded exactly as typed | Rewrite the question, multi-query, HyDE, metadata filters |
+| Retrieval | One dense vector search, top-K | Hybrid (dense + BM25) with fusion, filters |
+| After retrieval | Top-K chunks go straight into the prompt | Rerank, merge overlapping chunks, score threshold, ordering |
+| Generation | Chunks stuffed into the prompt | Grounded prompt, citations, "I don't know" handling |
+| Measuring | Eyeball a few answers | Test set with retrieval and answer metrics |
+
+| Failure in naive RAG | Typical fix |
+|---|---|
+| Follow-up question ("what about databases?") finds nothing | Query rewriting (14.5) |
+| Exact terms, names, error codes, IDs are missed | BM25 / hybrid search (14.2, 14.3) |
+| Right chunk is retrieved but ranked 8th, so it is cut at top-3 | Reranking (14.4) |
+| Results come from the wrong document or user | Metadata filtering (14.1) |
+| One phrasing of the question misses the answer | Multi-query, HyDE (14.5, 14.6) |
+| LLM answers even when nothing relevant was found | Score threshold, "I don't know" prompt (14.7) |
+| You can't tell if a change helped | Evaluation (14.8) |
+
+The full advanced pipeline:
+
+```mermaid
+flowchart TD
+    Q["User question"] --> RW["Rewrite with chat history<br/>standalone question"]
+    RW --> MQ["Optional: multi-query or HyDE<br/>2 to 4 variants"]
+    MQ --> D["Dense vector search<br/>top 20"]
+    MQ --> B["BM25 keyword search<br/>top 20"]
+    MF["Metadata filter<br/>userId, docId, date"] -.-> D
+    MF -.-> B
+    D --> F["Fusion (RRF)<br/>one merged list"]
+    B --> F
+    F --> RR["Rerank with a cross-encoder<br/>keep top 5"]
+    RR --> T["Score threshold<br/>nothing relevant? say so"]
+    T --> C["Assemble context<br/>merge overlaps, order, label sources"]
+    C --> L["LLM, grounded prompt"]
+    L --> A["Answer with citations"]
+```
+
+Every box adds latency, cost, or both. Add them **one at a time and measure** (14.8). Don't build all of it up front.
+
+### 14.1 Metadata filtering
+
+Each point's payload can carry metadata next to the chunk text: `userId`, `docId`, `fileName`, `page`, `section`, `uploadedAt`, `docType`, `tags`. A **filter** restricts the search to points whose payload matches, **before or while** vectors are compared.
+
+```json
+POST /collections/{name}/points/query
+{
+  "query": [ ...384 numbers... ],
+  "filter": {
+    "must": [
+      { "key": "docId", "match": { "value": "doc-42" } },
+      { "key": "page",  "range": { "gte": 1, "lte": 5 } }
+    ]
+  },
+  "limit": 5,
+  "with_payload": true
+}
+```
+
+Create a **payload index** for each field you filter on (otherwise Qdrant has to scan payloads):
+
+```json
+PUT /collections/{name}/index
+{ "field_name": "docId", "field_schema": "keyword" }
+```
+
+| Filter use | Example |
+|---|---|
+| Isolation | `userId = u1` (a shared collection instead of one collection per user) |
+| Scope | "only this document", "only the 2024 reports" |
+| Document type | Only resumes, only invoices |
+| Time | `uploadedAt >= 2026-01-01` |
+| Access control | `allowedRoles` contains the caller's role |
+
+- **Pre-filtering vs post-filtering:** post-filtering takes the top-K first and then drops the ones that don't match, which can leave you with 0 results. Qdrant applies the filter **during** the HNSW search, so you still get K matching results. That is why the payload index matters.
+- **Filters are exact, vectors are fuzzy.** Use filters for hard constraints (who, which document, when) and vectors for meaning.
+- **Security:** the filter must be set by the server from the logged-in user, never copied from the request body, or a user can read another user's chunks.
+- **Self-query (advanced):** an LLM turns "resumes from 2025 about AWS" into a filter (`docType = resume, year = 2025`) plus a query ("AWS"). It is more flexible but adds an LLM call and can produce a wrong filter.
+
+### 14.2 BM25 (keyword search)
+
+Dense vectors capture meaning but can miss **exact tokens**: product codes (`SKU-4481`), error names (`ECONNRESET`), people's names, version numbers, rare jargon. **BM25** is the classic keyword ranking that handles these well. It scores a chunk by how many of the query's words it contains, weighted by how rare each word is.
+
+$$\text{score}(D,Q) = \sum_{q \in Q} \text{IDF}(q) \cdot \frac{f(q,D)\,(k_1+1)}{f(q,D) + k_1\left(1 - b + b\,\frac{|D|}{\text{avgdl}}\right)}$$
+
+$$\text{IDF}(q) = \ln\!\left(1 + \frac{N - n_q + 0.5}{n_q + 0.5}\right)$$
+
+| Symbol | Meaning |
+|---|---|
+| $f(q,D)$ | How many times word $q$ appears in chunk $D$ (term frequency) |
+| $N$, $n_q$ | Total chunks, and how many chunks contain $q$ |
+| $\lvert D\rvert$, avgdl | Length of this chunk, and the average chunk length |
+| $k_1$ (about 1.2) | How quickly repeated words stop adding score |
+| $b$ (about 0.75) | How strongly long chunks are penalized |
+
+Three ideas, with numbers (N = 1,000 chunks):
+
+```
+1. RARE WORDS COUNT MORE (IDF)
+   "ECONNRESET" appears in 2 chunks:   IDF = ln(1 + 998.5/2.5)  = ln(400.4) = 5.99
+   "error"      appears in 500 chunks: IDF = ln(1 + 500.5/500.5) = ln(2)    = 0.69
+   → a match on the rare word is worth about 8.7x more
+
+2. REPEATS HAVE DIMINISHING RETURNS (k1 = 1.2, chunk of average length)
+   word appears 1 time:   1 x 2.2 / (1 + 1.2)   = 1.00
+   word appears 3 times:  3 x 2.2 / (3 + 1.2)   = 1.57
+   word appears 10 times: 10 x 2.2 / (10 + 1.2) = 1.96   ← tops out near k1 + 1 = 2.2
+
+3. LONG CHUNKS ARE PENALIZED (b)
+   the same word count in a longer-than-average chunk gives a lower score
+```
+
+| | Dense (embeddings) | BM25 |
+|---|---|---|
+| Matches | Meaning, synonyms, paraphrases ("car" and "automobile") | The exact words |
+| Good at | Natural-language questions, vague wording | Names, codes, IDs, rare terms, acronyms |
+| Weak at | Exact strings, rare tokens, numbers | Synonyms and paraphrases ("JS" does not match "JavaScript") |
+| Needs a model? | Yes (MiniLM) | No, it is statistics over words |
+| Index | HNSW over vectors | Inverted index (word → list of chunks) |
+
+BM25 in a Node stack: a small in-process library (for example MiniSearch), Postgres full-text search, OpenSearch / Elasticsearch, or Qdrant **sparse vectors**. It needs the chunk text indexed in a second place, so it is more storage and one more thing to keep in sync.
+
+### 14.3 Hybrid search and fusion
+
+**Hybrid search** runs dense and BM25 searches in parallel and merges the two ranked lists. The scores can't be added directly (cosine is 0 to 1, BM25 is unbounded), so the common merge uses only the **ranks**: **Reciprocal Rank Fusion (RRF)**.
+
+$$\text{RRF}(d) = \sum_{\text{lists}} \frac{1}{k + \text{rank}_{\text{list}}(d)}, \qquad k = 60$$
+
+Example:
+
+| Chunk | Dense rank | BM25 rank | RRF score |
+|---|---|---|---|
+| B | 2 | 1 | 1/62 + 1/61 = 0.0325 (1st) |
+| A | 1 | 3 | 1/61 + 1/63 = 0.0323 (2nd) |
+| D | not in the list | 2 | 1/62 = 0.0161 (3rd) |
+| C | 3 | not in the list | 1/63 = 0.0159 (4th) |
+
+A chunk that **both** methods like beats a chunk only one of them likes. No score tuning is needed, which is why RRF is the default.
+
+Qdrant can do this in one request (Query API with `prefetch` and fusion), but it needs a collection with **named vectors**: a dense one (384) and a sparse one:
+
+```json
+POST /collections/{name}/points/query
+{
+  "prefetch": [
+    { "query": [ ...dense 384... ],                        "using": "dense",  "limit": 20 },
+    { "query": { "indices": [..], "values": [..] },         "using": "sparse", "limit": 20 }
+  ],
+  "query": { "fusion": "rrf" },
+  "limit": 5
+}
+```
+
+- Our current collection has one unnamed vector, so hybrid means a **new collection and re-indexing**.
+- The sparse vector needs a sparse encoder (BM25-style or SPLADE). The alternative is a separate keyword index and fusing the two lists in your own code, which is easy with RRF.
+- Each of the lists is fetched with a larger limit (20 to 50) than the final K (3 to 5), so the fusion has something to work with.
+
+### 14.4 Reranking
+
+The embedding model is a **bi-encoder**: the chunk is turned into a vector **without seeing the question**, so a vector comparison is fast but coarse. A **cross-encoder** reads the **question and the chunk together** in one transformer pass. The question tokens and chunk tokens attend to each other (2c), so it judges relevance much more accurately, but it can't be precomputed and is far slower.
+
+| | Bi-encoder (MiniLM embeddings) | Cross-encoder (reranker) |
+|---|---|---|
+| Input | One text at a time | A (question, chunk) pair |
+| Output | A 384-number vector | One relevance score |
+| Precomputed and stored? | Yes, chunk vectors sit in Qdrant | No, run at query time |
+| Cost | One pass per text, then a fast vector search | One full pass **per candidate pair** |
+| Use | Find candidates among millions | Re-order a short candidate list |
+
+The pattern is **retrieve wide, then rerank narrow**:
+
+```
+Qdrant (fast, approximate)   top 20 to 50 candidates
+  ↓
+cross-encoder (slow, accurate)   score each (question, chunk) pair
+  ↓
+keep the best 3 to 5 → LLM
+```
+
+Why it helps: the right chunk is often retrieved but ranked 6th to 15th. With top-3 retrieval it would be cut. With top-20 and reranking it moves to the top.
+
+```javascript
+const { AutoTokenizer, AutoModelForSequenceClassification } = require('@xenova/transformers');
+const MODEL = 'Xenova/ms-marco-MiniLM-L-6-v2';
+const tok = await AutoTokenizer.from_pretrained(MODEL);
+const model = await AutoModelForSequenceClassification.from_pretrained(MODEL);
+
+async function rerank(question, hits, keep = 5) {
+  const inputs = tok(new Array(hits.length).fill(question), {
+    text_pair: hits.map(h => h.payload.text),
+    padding: true, truncation: true,
+  });
+  const { logits } = await model(inputs);   // one raw score per pair (not 0 to 1)
+  return hits
+    .map((h, i) => ({ ...h, rerankScore: logits.data[i] }))
+    .sort((a, b) => b.rerankScore - a.rerankScore)
+    .slice(0, keep);
+}
+```
+
+This is a sketch, so check the call shape against your `@xenova/transformers` version. Notes:
+- Candidate count is the knob: more candidates means better recall but linear extra cost (each pair is a model pass). 20 to 50 is typical.
+- Cross-encoders have their own token limit (usually 512 for the pair), so long chunks are truncated here too (see the attention note in 7.2).
+- Reranker scores are raw logits. Use them to **sort**, and don't compare them to the cosine `score_threshold`.
+- Hosted alternatives (Cohere Rerank, Voyage) are an API call instead of local compute.
+
+### 14.5 Query rewriting
+
+The user's words are often a bad search query. Rewrite them with an LLM **before** embedding.
+
+**1. Make follow-ups standalone.** The embedding of "What about databases?" has no subject, so it matches nothing useful:
+
+```
+History:   User: Tell me about Ganesh's Node.js experience
+           Assistant: He has 3 years of experience with Express and NestJS ...
+New:       What about databases?
+
+Prompt:    Rewrite the new question as a standalone question that needs no history.
+           Output only the question.
+
+Result:    "What databases does Ganesh have experience with?"   ← this is what gets embedded
+```
+
+Keep the **original** question for the final prompt to the LLM, and use the rewritten one only for retrieval.
+
+**2. Other rewrites:**
+
+| Technique | What it does | When it helps |
+|---|---|---|
+| Clarify / expand | Fix typos, expand acronyms ("JS" → "JavaScript"), add key terms | Short or sloppy questions |
+| **HyDE** (hypothetical document) | The LLM writes a short **fake answer**, and you embed that instead of the question | Answers look more like chunks than questions do, so they sit closer in vector space |
+| Step-back | Turn a specific question into a more general one and search for both | Questions that need background context |
+| Decomposition | Split "compare A and B" into two searches | Multi-part questions |
+
+Costs and risks: an extra LLM call before every search (added latency and cost), and a bad rewrite loses the user's intent. HyDE can bias the search with details the LLM made up. Use a small, fast model for rewriting.
+
+### 14.6 Multi-query retrieval
+
+One phrasing may not match the wording in the chunk. **Multi-query** asks the LLM for several rewrites, searches with each, and merges the results.
+
+```
+Question: "How does he handle scaling?"
+  ↓ LLM generates 3 variants
+  1. "What experience does he have with scalable architecture?"
+  2. "Has he worked with load balancing or horizontal scaling?"
+  3. "Which AWS services has he used for high traffic systems?"
+  ↓ search each (top 5)        → 3 result lists
+  ↓ merge by chunk id, fuse with RRF (14.3), deduplicate
+  ↓ top 5 → (optional rerank) → LLM
+```
+
+- It improves **recall** for vague or broad questions.
+- Cost: 1 extra LLM call, N embeddings and N searches. Qdrant's batch query endpoint runs the N searches in one request.
+- The merge step matters: a chunk found by several variants gets a higher RRF score.
+- Use it only if your evaluation (14.8) shows recall is the problem. For precise questions it only adds latency.
+
+### 14.7 Context assembly, citations and "I don't know"
+
+What happens **after** retrieval decides the answer quality too.
+
+| Step | What and why |
+|---|---|
+| Score threshold | If the best score is below a cutoff (for example cosine 0.4, or a low rerank score), skip the LLM or answer "I couldn't find this in your documents". Without it the LLM invents an answer from weak chunks |
+| Merge overlaps | Our chunks overlap by 20%, so adjacent hits repeat the same sentences. Merge consecutive chunks (same `docId`, neighbouring index) into one block, which saves tokens |
+| Deduplicate | Remove near-identical chunks from different uploads of the same file |
+| Order | LLMs use the start and end of a long prompt best ("lost in the middle"), so put the strongest chunks first (and last) and weaker ones in the middle |
+| Token budget | Count tokens: K × chunk size + history + instructions + question + answer room must fit the context window (6.2, 13.5) |
+| Label sources | Give each chunk an id and metadata so the LLM can cite it |
+
+Small-to-big (parent document) retrieval: embed **small** chunks for precise matching, but send the LLM the larger parent section (store `parentId` in the payload and fetch the parent text). Small chunks match better, big chunks answer better.
+
+Grounded prompt with citations:
+
+```
+Answer ONLY from the sources below. Cite the source number like [1] after each claim.
+If the sources do not contain the answer, reply exactly: "I couldn't find that in the documents."
+
+[1] (resume.pdf, page 2)  He built REST APIs using Express and NestJS ...
+[2] (resume.pdf, page 3)  Databases: DynamoDB, PostgreSQL ...
+
+Question: What databases does he know?
+```
+
+Citations let a user verify the answer and let you check later that a claim is supported by the cited chunk.
+
+### 14.8 RAG evaluation
+
+"Looks good to me" does not tell you whether a change made things better. Evaluate the **two halves separately**:
+
+```
+question → RETRIEVAL (did the right chunk come back?) → GENERATION (did the LLM answer correctly from it?)
+```
+
+**Step 1: build a test set.** 30 to 50 real questions with the expected source chunk(s) and a short reference answer, stored as JSON. Write them from your real documents, and include hard cases (follow-ups, exact codes, questions that have no answer). Re-run it after every change (chunk size, model, K, reranker): that is your **regression test**.
+
+**Retrieval metrics** (need only the question and the expected chunk id):
+
+| Metric | Meaning |
+|---|---|
+| Hit rate @K (recall@K) | Fraction of questions where the expected chunk is in the top K |
+| Precision @K | Of the K chunks returned, how many are relevant |
+| MRR (mean reciprocal rank) | Average of 1 / rank of the first relevant chunk |
+| nDCG @K | Like precision, but rewards putting relevant chunks higher |
+
+Example, 5 questions, rank of the expected chunk in the top 5:
+
+```
+Q1: rank 1     Q2: rank 3     Q3: not found     Q4: rank 2     Q5: rank 1
+
+Hit rate @5 = 4 / 5 = 0.80
+MRR         = (1 + 1/3 + 0 + 1/2 + 1) / 5 = 2.83 / 5 = 0.57
+```
+
+One query with 3 relevant chunks in total, 2 of them in the top 5: precision@5 = 2/5 = 0.4, recall@5 = 2/3 = 0.67.
+
+**Generation metrics** (need the question, the retrieved context and the answer):
+
+| Metric | Question it answers |
+|---|---|
+| Faithfulness / groundedness | Is every claim in the answer supported by the retrieved context? (catches hallucination) |
+| Answer relevance | Does the answer actually address the question? |
+| Context relevance / precision | How much of the retrieved context was useful versus noise? |
+| Correctness | Does the answer match the reference answer? |
+| Abstention | When nothing relevant exists, does it say "I don't know" instead of inventing? |
+
+How to score them: **LLM-as-judge** (a strong model with a fixed rubric, temperature 0, scores 1 to 5 or yes/no per claim), plus human spot checks. Judges have biases (they favour long and confident answers), so calibrate them against a few human-labelled examples. Frameworks such as RAGAS, TruLens and DeepEval package these metrics, but the idea is simple enough to build with a script.
+
+**Read the results in this order:**
+
+| Finding | Where the problem is |
+|---|---|
+| Hit rate @K is low | Retrieval: chunking, embedding model, hybrid, reranking, filters, query rewriting |
+| Hit rate is high but answers are wrong | Generation: prompt, context order and size, LLM choice |
+| Answers are right but not faithful | The LLM is using its own memory. Strengthen "answer only from sources" and add citations |
+| Good on easy questions, bad on follow-ups | Query rewriting and chat history |
+
+Also track latency and cost per question, since every advanced step adds both.
+
+### 14.9 What to add first (for our app)
+
+| Order | Step | Why it comes first |
+|---|---|---|
+| 1 | Score threshold, "I don't know" prompt, citations | Cheap, and stops made-up answers |
+| 2 | Metadata filter (`userId`, `docId`) with payload indexes | Cheap, correct scoping, and better security |
+| 3 | Evaluation set (30 to 50 questions) | Lets you prove each later step helps |
+| 4 | Chunk token check (7.2 attention note) | Avoids silent loss in the embedding step |
+| 5 | Reranking (retrieve 20, keep 5) | Usually the biggest quality gain for a small cost |
+| 6 | Query rewriting for chat follow-ups | Needed as soon as users ask multi-turn questions |
+| 7 | Hybrid search (BM25 + dense) | When exact terms, names or codes are missed (needs re-indexing) |
+| 8 | Multi-query, HyDE, small-to-big | Only if the evaluation shows recall is still low |
+
+---
+
+## 15. RAG design checklist: decisions and parameters
+
+When you design any RAG system, these are the decisions to make, in pipeline order. For each one: what it is, a sensible starting value, and how to tune it. The section numbers point to the explanation.
+
+### 15.1 Ingestion
+
+| Decision | Starting value (our app) | Guidance |
+|---|---|---|
+| Text extraction and cleaning | Per file type, then `cleanText` | Remove noise (headers, page numbers, control chars), keep punctuation (2.1) |
+| Chunk size | 500 chars (about 100 tokens) | Keep under the embedding model's token limit, about 150 to 200 tokens at most. Too small loses context, too large blurs meaning (2.3, 7.2) |
+| Overlap | 100 chars (20%) | 10 to 20% so sentences that cross a boundary stay intact (2.4) |
+| Chunking strategy | Fixed size | Use paragraph, sentence or recursive chunking for structured documents (2.5) |
+| Metadata in the payload | `userId`, `docId`, `fileName`, `page`, `chunkIndex` | Decide now: every field you may filter on later must be stored at ingestion (14.1) |
+| Chunk ids | Deterministic (for example a hash of `docId` + `chunkIndex`) | Re-uploading overwrites instead of duplicating |
+
+### 15.2 Embedding model
+
+| Decision | Starting value | Guidance |
+|---|---|---|
+| Model | `all-MiniLM-L6-v2` | Pick for language, domain, quality, speed and cost. Larger models (768, 1,024+ dimensions) are more accurate but slower and need more storage |
+| Dimensions | 384 (fixed by the model) | Becomes the Qdrant `size`. Changing the model changes it |
+| Max input tokens | 256 | Tokens beyond it are silently dropped (7.2) |
+| Pooling and normalization | `mean`, `normalize: true` | Use what the model was trained with (3) |
+| Query and document prefixes | None for MiniLM | Some models (E5, BGE and others) need a prefix such as `query:` and `passage:`. Check the model card |
+| Same model for chunks and questions | Always | Vectors from different models are not comparable |
+
+### 15.3 Vector database (Qdrant)
+
+| Decision | Starting value | Guidance |
+|---|---|---|
+| Distance metric | `Cosine` | The metric the embedding model was trained with (5.4) |
+| Vector `size` | 384 | Must equal the model output exactly |
+| `m` | 16 | Links per node. Higher means better recall and more RAM (5.6) |
+| `ef_construct` | 100 | Build effort. Higher means a better graph and slower indexing (5.6) |
+| `hnsw_ef` (per search) | Collection default (`ef_construct`) | Search effort. Raise it first if recall is poor. Must be at least `limit` (5.6) |
+| Payload indexes | One per field you filter on | Without them filtered search is slow (14.1) |
+| Collection layout | One per user (small scale) | A shared collection with a `userId` filter at scale (4, 13.4) |
+| Quantization / on-disk vectors | Off | Turn on when RAM becomes the limit (13.4) |
+| Shards and replicas | 1 / 1 | Raise for size or availability in a cluster |
+
+### 15.4 Retrieval
+
+| Decision | Starting value | Guidance |
+|---|---|---|
+| Top-K (`limit`) | 3 to 5 | K × chunk tokens must fit the LLM prompt budget (5.3, 6.2) |
+| Score threshold | About 0.3 to 0.5 for cosine | Below it, say "not found" instead of guessing. Calibrate on your own data (14.7) |
+| Filters | `userId` always, `docId` when scoped | Set by the server, never from the request (14.1) |
+| Candidate count for reranking | 20 to 50, keep 3 to 5 | Only if you add a reranker (14.4) |
+| Hybrid search | Off | Turn on if exact terms, names or codes are missed (14.3) |
+| Query rewriting | Off | Turn on for multi-turn chat (14.5) |
+
+### 15.5 Generation
+
+| Decision | Starting value | Guidance |
+|---|---|---|
+| LLM and context window | For example Llama 3 8B, 8K | Set the window explicitly (`num_ctx` in Ollama) (6.2, 13.5) |
+| Prompt template | Instructions, then context, then history, then question | "Answer ONLY from the sources, else say you don't know", plus citations (14.7) |
+| Temperature | Low (0 to 0.3) | Factual question answering should be stable, not creative |
+| Max output tokens | Set per request | Leave room in the window for the answer |
+| Chat history | Last N turns or a summary | Sliding window so it never overflows (6.2) |
+| Streaming | On | Shows the first tokens quickly (SSE) |
+
+### 15.6 Operations and safety
+
+| Decision | Starting value | Guidance |
+|---|---|---|
+| Embedding batch size | 16 to 64 chunks | Bigger batches use more memory, smaller ones are slower |
+| Upsert batch size and `wait` | 100 to 500 points, `wait=true` when you search right after | Stay under the request limits (13.3) |
+| Upload caps | Max file size, pages and chunks per upload | Protects CPU, RAM and cost (13.6) |
+| Per-user quotas | Stored chunks, uploads, questions per minute | Prevents one user exhausting the system |
+| Caching | Cache embeddings of repeated questions, and answers for identical questions | Saves compute and LLM cost |
+| Update and delete | Delete by `docId` filter, re-upsert the changed file | Keep the vector store in sync with the source files |
+| Model or chunking change | New collection, re-embed everything | Old and new vectors can't be mixed. Version the collection name (for example `docs_v2`), switch over, then drop the old one |
+| Security | Server-side `userId` filter, treat document text as untrusted | A document can contain instructions aimed at the LLM (prompt injection). Strip or fence them and never give the LLM powerful tools on that basis |
+| Monitoring | Latency per stage, empty-result rate, token usage, errors | Embed, search, rerank and LLM each have their own latency |
+| Evaluation | Test set re-run on every change | Retrieval and answer metrics (14.8) |
+
+### 15.7 Sizing worksheet
+
+Estimate before you build:
+
+```
+Example: 10,000 documents × 20 chunks each = 200,000 chunks
+
+Vector RAM     = 200,000 × 384 × 4 bytes × 1.5 = about 460 MB          (13.4)
+Payload disk   = 200,000 × about 0.7 KB          = about 140 MB
+Embedding time = 200,000 chunks ÷ your chunks-per-second on this CPU (measure it)
+Prompt budget  = K (5) × chunk tokens (about 120) + history + instructions + question + answer room
+                 must stay under the LLM context window
+```
+
+The decision order that avoids rework:
+
+1. What questions will users ask, and from which documents? (this decides the chunking and the metadata)
+2. Which embedding model? (this fixes dimensions, token limit and distance)
+3. Chunk size and overlap that fit the model's token limit.
+4. Collection layout, metadata fields and payload indexes.
+5. K, score threshold, and the LLM prompt budget.
+6. An evaluation set, then add reranking, hybrid search or query rewriting only if the numbers say so (14.9).
+
+The parameters that **force re-embedding all documents** when changed: embedding model, dimensions, chunk size and overlap (and the distance metric, which needs a new collection). `m` and `ef_construct` only make Qdrant rebuild its graph in the background, with no re-embedding. The ones you can change at any time: K, score threshold, `hnsw_ef`, filters, the prompt and the LLM.
+
+---
+
+## 16. Sizing the LLM system: formulas and worked example
+
+Section 14.8 measures whether answers are good. This section decides whether the LLM you picked **fits your hardware and is fast enough**. The explanations behind every term (number formats, quantization, KV cache, prefill and decode) are in [LM_LLM.md](./LM_LLM.md), section 7.
+
+### 16.1 Three resources, three questions
+
+| Resource | Question | What uses it |
+|---|---|---|
+| **Memory** (VRAM) | Does it fit at all, and how long can the context be? | Weights + KV cache + overhead |
+| **Compute** (FLOPS) | How long until the first token? | Prefill: processing the whole prompt |
+| **Memory bandwidth** (GB/s) | How many tokens per second while answering? | Decode: reading weights and KV cache for every token |
+
+In a RAG app the prompt is long (chunks + history), so all three matter. Check them in this order: memory first (if it does not fit, nothing else matters), then first-token time, then generation speed.
+
+### 16.2 Terms and formulas
+
+| Symbol | Meaning | Where to find it |
+|---|---|---|
+| $P$ | Parameters (number of weights) | Model name, for example 3.2B |
+| $b_w$ | Bytes per weight: 2 (fp16), about 1.06 (8-bit), about 0.6 (4-bit) | Model file name or `torch_dtype` |
+| $L$ | Layers | `num_hidden_layers` in the model config |
+| $H_{kv}$ | K/V heads | `num_key_value_heads` |
+| $d_{head}$ | Numbers per head | `head_dim`, or hidden size ÷ query heads |
+| $d_{model}$ | Hidden size | `hidden_size` |
+| $b_{kv}$ | Bytes per KV cache number: 2 (fp16), 1 (8-bit) | Runtime setting |
+| $n$ | Tokens in the context | Prompt + answer |
+| $S$ | Requests running at the same time | Your traffic |
+| $BW$ | Memory bandwidth of the GPU | GPU spec sheet (real speed is lower) |
+| $\text{FLOPS}_{eff}$ | Compute you actually get | Measure it; the spec peak is optimistic |
+
+| What to find | Formula |
+|---|---|
+| Weights memory | $M_w = P \times b_w$ |
+| KV cache per token | $m_{kv} = 2 \times L \times H_{kv} \times d_{head} \times b_{kv}$ |
+| KV cache total | $M_{kv} = n \times m_{kv} \times S$ |
+| Does it fit? | $M_w + M_{kv} + M_{overhead} \le \text{VRAM}$ (overhead about 0.5 to 1 GB) |
+| Max tokens that fit | $n_{max} = \dfrac{\text{VRAM} - M_w - M_{overhead}}{m_{kv} \times S}$ |
+| Usable context | $\min(n_{model},\ n_{max})$, then set `num_ctx` to it (6.2) |
+| Time to first token | $T_{prefill} \approx \dfrac{2\,P\,n + 2\,n^2\,d_{model}\,L}{\text{FLOPS}_{eff}}$ |
+| Generation speed | $\text{tok/s} \approx \dfrac{BW}{M_w + n \times m_{kv}}$ |
+| Total answer time | $T \approx T_{prefill} + \dfrac{n_{out}}{\text{tok/s}}$ |
+| Prompt budget | instructions + $K \times$ chunk tokens + history + question + $n_{out} \le n_{usable}$ |
+
+What the formulas say:
+- Memory for weights is **constant**; the KV cache grows **linearly** with $n$ and with $S$.
+- Prefill time grows **linearly plus quadratically** with the prompt length (the $n^2$ attention term).
+- Generation speed falls slowly as the context grows, because the KV cache must be read for every token.
+- Quantizing the weights shrinks $M_w$, which helps fit **and** speeds up generation. It barely changes prefill time.
+
+### 16.3 Worked example: a 4 GB GPU
+
+Assumptions (replace with your own numbers): 4 GB VRAM, about 100 GB/s effective bandwidth, about 5 TFLOPS effective. Model: Llama 3.2 3B in 4-bit ($P$ = 3.2B, $b_w$ about 0.6, so $M_w$ about 2.0 GB; $L$ = 28, $H_{kv}$ = 8, $d_{head}$ = 128, $d_{model}$ = 3072), fp16 KV cache.
+
+```
+1. Fits?            M_w = 3.2e9 × 0.6 B = about 2.0 GB   < 4 GB                      yes
+2. KV per token     2 × 28 × 8 × 128 × 2 = 114,688 B                                about 112 KB
+3. Free for KV      4.0 - 2.0 (weights) - 0.7 (overhead)                           = 1.3 GB
+4. Max tokens       1.3 GB ÷ 112 KB                                               about 11,000 to 12,000
+5. Choose           num_ctx = 8,192 (headroom)                                     KV about 0.9 GB
+```
+
+Same GPU, other choices:
+
+| Choice | Result |
+|---|---|
+| 3B in fp16 (6.4 GB) | Does not fit |
+| 8B in 4-bit (4.9 GB) | Does not fit entirely. Layers spill to the CPU, several times slower |
+| 1B in 4-bit (0.8 GB, 32 KB per token) | About 2.5 GB left, so roughly 76,000 tokens (its own limit is 128K) |
+| 3B with an 8-bit KV cache (56 KB per token) | About 2× the tokens, roughly 22,000 to 24,000 |
+| 2 users at the same time | Cache is split: about 5,500 to 6,000 tokens each |
+
+### 16.4 RAG request time budget
+
+Same setup (3B, 4-bit, 5 TFLOPS, 100 GB/s). One RAG question: system instructions 300 + 5 chunks × 120 + history 2,000 + question 50 gives about 3,000 prompt tokens, and the answer is 500 tokens.
+
+```
+Prefill   2 × 3.2e9 × 3,000 = 19.2 TFLOPs, plus attention 2 × 3,000² × 3072 × 28 = 1.5 TFLOPs
+          20.7 TFLOPs ÷ 5 TFLOPS                         = about 4.2 s to the first token
+Decode    context about 3,500 tokens: KV 0.40 GB + weights 2.0 GB = 2.4 GB per token
+          100 GB/s ÷ 2.4 GB                               = about 42 tok/s
+          500 tokens ÷ 42                                 = about 12 s
+Total                                                      = about 16 s
+```
+
+What each knob does:
+
+| Change | Prompt | Answer | Prefill | Decode | Total |
+|---|---|---|---|---|---|
+| Baseline | 3,000 | 500 | 4.2 s | 12 s | about 16 s |
+| Trim history from 2,000 to 500 tokens | 1,500 | 500 | 2.0 s | 11 s | about 13 s |
+| Cap the answer at 250 tokens | 3,000 | 250 | 4.2 s | 6 s | about 10 s |
+| Both | 1,500 | 250 | 2.0 s | 5.6 s | about 7.6 s |
+
+On a small GPU the **answer length** usually costs more time than the prompt. Cutting K from 5 to 3 saves only about 240 tokens (about 0.3 s of prefill).
+
+### 16.5 Decision checklist
+
+1. Read the model config: trained context, $L$, $H_{kv}$, $d_{head}$, $d_{model}$, and the parameter count.
+2. Choose the number format: the highest bits whose weights still leave room for the KV cache you need.
+3. Compute $m_{kv}$ and $n_{max}$ for your VRAM and expected $S$.
+4. Set `num_ctx` explicitly to the usable context (not the model maximum), and make sure the RAG prompt budget fits inside it.
+5. Estimate $T_{prefill}$ for a typical prompt and tok/s at a typical context, then **measure** both on the real machine.
+6. If the numbers are not acceptable, change the knob that matches the symptom:
+
+| Symptom | Likely cause | What to change |
+|---|---|---|
+| Model fails to load, or out-of-memory | Weights + KV cache + overhead above VRAM | Smaller model, fewer bits, shorter `num_ctx`, 8-bit KV cache |
+| Context shorter than the RAG prompt needs | $n_{max}$ too small | 8-bit KV cache, smaller or more quantized model, fewer concurrent requests |
+| Slow first token | Long prompt (prefill is compute-bound and quadratic) | Smaller K, shorter history, merge overlapping chunks, prefix caching (stable text first) |
+| Slow generation | Reading weights + KV cache every token | Smaller or more quantized model, shorter context, cap the answer, a GPU with more bandwidth |
+| Very slow overall | Some layers run on the CPU | Model too big for VRAM: reduce the model or the bits |
+| Answers got worse after quantizing | Rounding error from fewer bits | Use 5- or 8-bit, or a larger model with 4-bit |
+
+Notes:
+- The embedding model (MiniLM, about 22M parameters, under 100 MB in fp32) and Qdrant are separate from this budget. If they share the same GPU or RAM, subtract their memory too.
+- The formulas are estimates. Real speeds are below the spec-sheet bandwidth and FLOPS, so treat them as a way to rule models in or out, then measure.
+- Changing the LLM or its quantization never needs re-embedding documents. Only the embedding model and chunking do (15.7).
 
 ---
 
@@ -1586,3 +2442,23 @@ Without pooling, `output.data` is a flat array of all of them, which is meaningl
 | Wo | Output matrix of attention; mixes the concatenated heads (384 × 384 in MiniLM) |
 | Residual connection | Adding a block's input back to its output so information isn't lost |
 | LayerNorm | Rescales each token vector to a stable range after a block |
+| BM25 | Keyword ranking: rare words count more, repeats have diminishing returns, long chunks are penalized |
+| Hybrid search | Dense vector search and keyword (BM25) search combined, results merged by fusion |
+| RRF | Reciprocal Rank Fusion: merges ranked lists using `1 / (60 + rank)` per list |
+| Bi-encoder | Encodes each text separately into a vector (MiniLM); fast, used for retrieval |
+| Cross-encoder | Reads the question and chunk together and outputs a relevance score; slower, used for reranking |
+| Reranking | Re-ordering the top 20 to 50 retrieved candidates with a cross-encoder, keeping the best few |
+| Query rewriting | Using an LLM to turn the user's text into a better standalone search query |
+| HyDE | Embedding an LLM-written hypothetical answer instead of the question |
+| Multi-query | Searching with several LLM-generated variants of the question and merging the results |
+| Hit rate / MRR | Retrieval metrics: expected chunk in the top K, and the average of 1 / rank of the first relevant chunk |
+| Faithfulness | Whether every claim in the answer is supported by the retrieved context |
+| Parameter | One learned number in a model's weights ("3B" = 3 billion) |
+| fp16 / bf16 | 16-bit number formats, 2 bytes per weight. The usual released format of a model |
+| Quantization | Storing weights (or the KV cache) with fewer bits, for example 4-bit, by rounding to a small set of values with a scale per block. Needs no retraining |
+| Q4 / Q8 | 4-bit and 8-bit quantized model files (about 0.6 and 1.06 bytes per weight) |
+| VRAM | GPU memory: holds the weights, the KV cache and runtime buffers |
+| GQA | Grouped-query attention: several query heads share one K/V head, which shrinks the KV cache |
+| Memory-bound / compute-bound | Decode is limited by memory bandwidth (reading weights and cache per token); prefill is limited by compute |
+| Time to first token | The prefill time: how long until the answer starts |
+| `num_ctx` | The context length the runtime allocates (Ollama setting); decides the KV cache size |
