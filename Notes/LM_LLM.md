@@ -964,6 +964,46 @@ With several requests at once, the weights are read once per step for all of the
 
 These are estimates: real speeds are below the peak numbers (use the GPU's memory bandwidth for $BW$ and measure real tokens per second).
 
+**Design calculations: what do I need?** The same formulas in reverse, for choosing hardware and prompt limits.
+
+*Prefill is limited by compute.* Each prompt token costs about 2 FLOPs per weight:
+
+$$F_{prefill} \approx 2 \times P \times n \qquad\Rightarrow\qquad \text{TFLOPs needed} = 2 \times \text{weights} \times \text{prompt tokens}$$
+
+- The KV cache is **not** multiplied in here. It only enters through the attention term $2\,n^2\,d_{model}\,L$, which is small for short prompts (about 5% at 2,000 tokens, about 25% at 12,000).
+- Quantizing does not reduce it, because the number of weights is the same.
+- FLOPs (amount of work) and FLOPS (speed per second) are different units. Required hardware speed for a first-token target, and the prompt limit that keeps the first token within the target:
+
+$$\text{TFLOPS}_{req} = \frac{F_{prefill}}{T_{target}} \qquad\qquad n_{TTFT} \approx \frac{\text{FLOPS}_{eff} \times T_{target}}{2P}$$
+
+*Decode is limited by memory bandwidth.* Every generated token reads all weights plus the KV cache so far:
+
+$$\text{tok/s} = \frac{BW}{M_w + M_{kv}} \qquad\Rightarrow\qquad BW_{req} = \text{tok/s}_{target} \times (M_w + M_{kv})$$
+
+- $M_w$ is the weights **in their stored format** (4-bit counts as about 0.6 bytes per weight), so quantizing speeds decode up.
+- $M_{kv} = n \times m_{kv}$ grows with the context, so speed drops as the conversation gets longer.
+
+*Prompt limit for an app* is the smallest of the three limits, minus room for the answer:
+
+$$n_{prompt} = \min(n_{model},\ n_{max},\ n_{TTFT}) - n_{out}$$
+
+Examples (3B model in 4-bit: $P$ = 3.2B, weights 2.0 GB, $d_{model}$ = 3072, $L$ = 28):
+
+```
+Compute needed (prefill)
+  3,000-token prompt: 2 × 3.2e9 × 3,000 = 19.2 TFLOPs (+ 1.5 attention = 20.7 TFLOPs)
+  first token within 2 s  -> need about 10 TFLOPS      (a 5 TFLOPS GPU needs 4.2 s)
+
+Prompt limit from a first-token target
+  GPU gives 5 TFLOPS, target 3 s -> budget 15 TFLOPs
+  n = 15e12 ÷ (2 × 3.2e9) = about 2,300 tokens; with the attention term about 2,200
+  -> cap the prompt at about 2,200 tokens
+
+Bandwidth needed (decode)
+  want 30 tok/s, context 4,000 tokens: weights 2.0 GB + KV 0.46 GB = 2.46 GB per token
+  30 × 2.46 = about 74 GB/s needed                    (100 GB/s gives about 40 tok/s)
+```
+
 ### 7.8 Worked example: a 4 GB GPU
 
 Assumptions: 4 GB of GPU memory, about 100 GB/s effective bandwidth, about 5 TFLOPS effective. Model: Llama 3.2 3B in 4-bit (about 2.0 GB), fp16 KV cache.
