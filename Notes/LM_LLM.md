@@ -933,6 +933,63 @@ The attention term comes from the two products $Q K^\top$ and weights × $V$: ea
 
 A 6× longer prompt costs about 7.5× more, and the gap widens as the prompt grows.
 
+**Reading the prefill formula.**
+
+| Symbol | Meaning | Unit |
+|---|---|---|
+| $F_{prefill}$ | Total **work** to process the prompt (depends on the model and $n$, not on the hardware) | FLOPs (a count) |
+| $\text{FLOPS}_{eff}$ | Real **speed** of the GPU | FLOPs per second |
+| $T_{prefill}$ | **Time** = work ÷ speed, the time to first token | seconds |
+| $P$, $n$, $d_{model}$, $L$ | Parameters, prompt tokens, vector width, layers | |
+
+- **Linear part, $2Pn$:** every token goes through every weight once, and one weight does a multiply and an add (2 FLOPs). $P$ is the weight count of the **whole model**, so the layers are already inside it. Multiplying by $L$ again would count them twice. (If you only know one layer's weights, then it is $2 \times P_{layer} \times L \times n$.)
+- **Attention part, $2n^2 d_{model} L$:** no weights here, only token-against-token math.
+  - One score is a dot product over $d_{model}$ numbers (all heads together): $2\,d_{model}$ FLOPs.
+  - There are $n \times n$ scores, so $QK^\top$ costs $2n^2 d_{model}$, and weights × $V$ costs the same.
+  - Together $4n^2 d_{model}$, and the causal mask halves it to $2n^2 d_{model}$ per layer.
+  - It is repeated in every layer, so multiply by $L$.
+  - The projections Wq, Wk, Wv, Wo are weights, so they are in the linear part, not here.
+- **What the linear part is:** it is not a pipeline stage. It is the total cost of all weight-matrix multiplies inside the layers (Wq, Wk, Wv, Wo and the MLP). The embedding lookup is only a table read, about 0 FLOPs.
+- **Rough split of the linear work in Llama 3 8B:** the MLP holds about 81% of a layer's weights (176M of 218M), attention projections about 19%.
+- **Refinement:** the embedding table (525M) costs no FLOPs, and the output head runs only for the last prompt token during prefill. So the effective $P$ for prefill is about 7.0B, and the linear term is about 13% lower than $2 \times 8.03\text{B} \times n$.
+
+**Worked example: Llama 3 8B** ($P$ = 8.03B, $d_{model}$ = 4096, $L$ = 32), 2,000 prompt tokens:
+
+```
+linear    = 2 × 8.03e9 × 2000          = 32.1 TFLOPs
+attention = 2 × 2000² × 4096 × 32      =  1.05 TFLOPs
+total F                                ≈ 33.2 TFLOPs
+```
+
+| Prompt tokens | Linear | Attention | Total | Time at 5 TFLOPS | Time at 66 TFLOPS |
+|---|---|---|---|---|---|
+| 2,000 | 32.1 | 1.05 | 33.2 TFLOPs | about 6.6 s | about 0.5 s |
+| 4,000 | 64.2 | 4.19 | 68.4 TFLOPs | about 13.7 s | about 1.0 s |
+| 8,000 | 128.5 | 16.8 | 145.3 TFLOPs | about 29 s | about 2.2 s |
+
+Doubling the prompt doubles the linear part but quadruples the attention part.
+
+**Where GPU FLOPS comes from.**
+
+$$\text{FLOPS}_{peak} = \text{cores} \times \text{clock} \times \text{FLOPs per cycle}$$
+
+Each core does one fused multiply-add per cycle, which counts as 2 FLOPs. RTX 4090 example: 16,384 CUDA cores × 2.52 GHz × 2 = 82.6 TFLOPS (fp32). LLM math runs on **tensor cores** (small matrix-multiply units), which reach about 165 TFLOPS in fp16 on that card.
+
+Peak is a fixed spec-sheet number, but $\text{FLOPS}_{eff}$, what you actually get, is lower and not constant (often 30 to 70% of peak in prefill):
+
+| Factor | Effect |
+|---|---|
+| Number format | Peak differs for fp32, fp16, int8 and tensor cores. Use the format the math really runs in (fp16, even with 4-bit weights) |
+| Clocks and power | Boost clocks drop with heat and power limits |
+| Kernel efficiency | Depends on the runtime and matrix shapes. Short prompts or small batches don't fill the GPU |
+| Memory stalls | Cores idle when data arrives too slowly (this is why decode uses only a tiny part of peak) |
+
+Prefill is compute-bound because the 2,000 prompt tokens are multiplied as one big matrix (`[2000, 4096] × [4096, 4096]` and so on): each weight read from VRAM is reused for all 2,000 tokens, so the cores have plenty of math per byte. Decode uses 1 token per weight read, so it waits on memory instead.
+
+**Measure your own $\text{FLOPS}_{eff}$:** run `ollama run <model> --verbose`, read `prompt eval rate` (tokens/s), then $\text{FLOPS}_{eff} \approx 2P \times \text{rate}$.
+
+**Cached prompts:** if the runtime reuses the KV cache of an unchanged prompt start, only the $m$ new tokens are prefilled. The linear term becomes $2Pm$, and attention about $2\,m\,n\,d_{model}\,L$.
+
 **Decode.** To produce one token the GPU must read the whole weights and the whole KV cache from memory:
 
 $$\text{tokens/s} \approx \frac{BW}{M_{weights} + n \times m_{kv}}$$
@@ -964,45 +1021,17 @@ With several requests at once, the weights are read once per step for all of the
 
 These are estimates: real speeds are below the peak numbers (use the GPU's memory bandwidth for $BW$ and measure real tokens per second).
 
-**Design calculations: what do I need?** The same formulas in reverse, for choosing hardware and prompt limits.
+**Recipe for any model:**
 
-*Prefill is limited by compute.* Each prompt token costs about 2 FLOPs per weight:
+1. **Collect inputs:** $P$, $d_{model}$, $L$, $H_{kv}$, $d_{head}$ (from `config.json`), bytes per weight, your typical and maximum prompt size $n$, and a measured $\text{FLOPS}_{eff}$ and $BW$.
+2. **Work:** $F_{prefill} = 2Pn + 2n^2 d_{model} L$.
+3. **Time to first token:** $T_{prefill} = F_{prefill} / \text{FLOPS}_{eff}$. Decode time is not part of it.
+4. **Memory fit (separate check, not added to time):** $M_w + n \times m_{kv} + M_{overhead} \le \text{VRAM}$.
+5. **Decode speed:** $\text{tok/s} \approx BW / (M_w + n \times m_{kv})$.
+6. **Total answer time:** $T_{prefill} + n_{out} / \text{tok/s}$, where $n_{out}$ is the answer length.
+7. Do it for both your typical prompt and the maximum, then verify with `ollama run <model> --verbose`.
 
-$$F_{prefill} \approx 2 \times P \times n \qquad\Rightarrow\qquad \text{TFLOPs needed} = 2 \times \text{weights} \times \text{prompt tokens}$$
-
-- The KV cache is **not** multiplied in here. It only enters through the attention term $2\,n^2\,d_{model}\,L$, which is small for short prompts (about 5% at 2,000 tokens, about 25% at 12,000).
-- Quantizing does not reduce it, because the number of weights is the same.
-- FLOPs (amount of work) and FLOPS (speed per second) are different units. Required hardware speed for a first-token target, and the prompt limit that keeps the first token within the target:
-
-$$\text{TFLOPS}_{req} = \frac{F_{prefill}}{T_{target}} \qquad\qquad n_{TTFT} \approx \frac{\text{FLOPS}_{eff} \times T_{target}}{2P}$$
-
-*Decode is limited by memory bandwidth.* Every generated token reads all weights plus the KV cache so far:
-
-$$\text{tok/s} = \frac{BW}{M_w + M_{kv}} \qquad\Rightarrow\qquad BW_{req} = \text{tok/s}_{target} \times (M_w + M_{kv})$$
-
-- $M_w$ is the weights **in their stored format** (4-bit counts as about 0.6 bytes per weight), so quantizing speeds decode up.
-- $M_{kv} = n \times m_{kv}$ grows with the context, so speed drops as the conversation gets longer.
-
-*Prompt limit for an app* is the smallest of the three limits, minus room for the answer:
-
-$$n_{prompt} = \min(n_{model},\ n_{max},\ n_{TTFT}) - n_{out}$$
-
-Examples (3B model in 4-bit: $P$ = 3.2B, weights 2.0 GB, $d_{model}$ = 3072, $L$ = 28):
-
-```
-Compute needed (prefill)
-  3,000-token prompt: 2 × 3.2e9 × 3,000 = 19.2 TFLOPs (+ 1.5 attention = 20.7 TFLOPs)
-  first token within 2 s  -> need about 10 TFLOPS      (a 5 TFLOPS GPU needs 4.2 s)
-
-Prompt limit from a first-token target
-  GPU gives 5 TFLOPS, target 3 s -> budget 15 TFLOPs
-  n = 15e12 ÷ (2 × 3.2e9) = about 2,300 tokens; with the attention term about 2,200
-  -> cap the prompt at about 2,200 tokens
-
-Bandwidth needed (decode)
-  want 30 tok/s, context 4,000 tokens: weights 2.0 GB + KV 0.46 GB = 2.46 GB per token
-  30 × 2.46 = about 74 GB/s needed                    (100 GB/s gives about 40 tok/s)
-```
+The KV cache does not add to prefill time. It affects whether the model fits in memory and how fast decode is, and its head size is $d_{head}$ (128 for Llama 3 8B), not $d_{model}$ (4,096).
 
 ### 7.8 Worked example: a 4 GB GPU
 
@@ -1049,6 +1078,11 @@ Variations on the same 4 GB:
 | "2 bytes per weight is fixed by the design" | It is the number format. The architecture fixes the parameter count, not the bytes per parameter |
 | "Quantization makes everything faster" | It cuts memory and decode time. Prefill is compute-bound and barely changes |
 | "A 128K model can use 128K context on any GPU" | Only if the weights and the KV cache fit. On 4 GB it is a small fraction of that |
+| "Prefill FLOPs = layers × P × n × 2" | $P$ already contains all layers. Linear part is $2Pn$. Only the attention part is multiplied by $L$ |
+| "$d_{model}$ (4,096) and $d_{head}$ (128) are the same" | $d_{model}$ = heads × $d_{head}$. Attention FLOPs use $d_{model}$, the KV cache uses $d_{head}$ and the K/V heads |
+| "A GPU has one constant FLOPS number" | Peak is a spec-sheet ceiling. Effective FLOPS is lower and varies with format, clocks, kernels and prompt size |
+| "Decode time is part of time to first token" | First token = prefill only. Decode is the streaming that follows |
+| "KV cache adds to prefill time" | It is memory, not FLOPs. It limits fit and slows decode |
 
 ---
 

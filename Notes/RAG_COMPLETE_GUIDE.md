@@ -2166,72 +2166,6 @@ How to score them: **LLM-as-judge** (a strong model with a fixed rubric, tempera
 
 Also track latency and cost per question, since every advanced step adds both.
 
-#### Evaluation cheat sheet (simple version)
-
-Evaluate in this order: **retrieval first** (cheap, no LLM needed), then **response** (needs an LLM judge or human check), then **system** numbers (time and cost).
-
-**A test row** (include some questions with no answer in the documents):
-
-```json
-{ "question": "What databases does he know?", "expectedChunkIds": ["doc1-c7"], "referenceAnswer": "DynamoDB and PostgreSQL" }
-{ "question": "What is his favourite colour?", "expectedChunkIds": [], "referenceAnswer": "I couldn't find that in the documents." }
-```
-
-**1. Retrieval metrics: did the right chunks come back?**
-
-| Metric | Simple meaning | Formula | Example | If it is low, try |
-|---|---|---|---|---|
-| **Hit rate @K** | Is the expected chunk anywhere in the top K? | questions with a hit ÷ all questions | 4 of 5 questions = 0.80 | Chunking, hybrid search, query rewriting, bigger K, reranking, `hnsw_ef` |
-| **MRR** | How high is the first right chunk? | average of 1 ÷ rank | ranks 1, 3, none, 2, 1 gives 0.57 | Reranking (the chunk is found but ranked low) |
-| **Precision @K** | How much of the top K is relevant? | relevant in top K ÷ K | 2 relevant of 5 = 0.4 | Score threshold, smaller K, reranking, filters |
-| **Recall @K** | How much of everything relevant was found? | relevant found ÷ all relevant | 2 of 3 = 0.67 | Bigger K, rewriting, multi-query (matters when an answer needs several chunks) |
-| **nDCG @K** | Are the relevant chunks near the top? | gain of relevant chunks, discounted by rank | 1 is perfect | Reranking |
-| **ANN recall** | Does HNSW return what an exact search returns? | ANN results in the exact top K ÷ K | 4 of 5 = 0.8 | Raise `hnsw_ef`, then `m` and `ef_construct` |
-| **Search latency** | How long a search takes (use p95) | measured | 20 ms | `hnsw_ef` lower, filters with payload indexes |
-
-Note: if only **one** chunk is relevant, precision @5 can never exceed 0.2. For such questions look at hit rate and MRR instead.
-
-**2. Response metrics: is the answer good?**
-
-| Metric | Simple meaning | Example | If it is low, try |
-|---|---|---|---|
-| **Faithfulness** | Is every claim supported by the retrieved chunks? | 4 of 5 claims supported = 0.8 | Stronger "answer only from the sources" prompt, lower temperature, score threshold, citations |
-| **Answer relevance** | Does the answer address the question? | judge score 1 to 5 | Query rewriting, better prompt, check the chunks are on topic |
-| **Correctness** | Does it match the reference answer? | judge or human yes/no | If retrieval is fine: prompt, LLM size, context order |
-| **Context precision** | How much of the retrieved context was useful? | 2 useful chunks of 5 = 0.4 | Smaller K, reranking, threshold |
-| **Context recall** | Does the retrieved context contain everything needed for the reference answer? | 2 of 3 needed facts present | Retrieval: chunking, K, hybrid |
-| **Abstention** | With no answer in the documents, does it say so? | 8 of 10 = 0.8 | Score threshold, "I don't know" instruction |
-| **Citation accuracy** | Does the cited chunk really support the claim? | 9 of 10 | Label sources clearly, shorter context |
-
-**3. System metrics: is it usable?**
-
-| Metric | What it tells you | Where it comes from |
-|---|---|---|
-| Time to first token (p95, worst-case prompt) | Prompt too long for the hardware? | Prefill cost (section 16) |
-| Tokens per second | Answer too slow? | Decode speed (section 16) |
-| Total time per question | End-to-end wait | Embed + search + rerank + LLM |
-| Tokens or cost per question | Budget | Prompt size × price, or GPU time |
-| Empty-result rate | How often nothing passes the threshold | Retrieval log |
-
-**4. Where is the problem?**
-
-| Hit rate @K | Faithfulness / correctness | Meaning | Look at |
-|---|---|---|---|
-| High | High | Working | Keep the test set as a regression check |
-| **High** | **Low** | The right chunks arrive, the LLM misuses them | Prompt, temperature, `num_ctx` (an over-long prompt is silently cut), chunk order ("lost in the middle"), LLM size |
-| **Low** | Low | The right chunks never arrive | Retrieval, in the order below |
-| Low | Answers look right but faithfulness is low | The LLM answers from its own memory | Stricter prompt, threshold, citations |
-
-When hit rate is low, check **exact versus ANN** first, so you tune the right thing:
-
-```json
-POST /collections/{name}/points/query
-{ "query": [ ...384 numbers... ], "limit": 5, "params": { "exact": true } }
-```
-
-- Exact search finds the expected chunk but the normal search does not: ANN is missing it. Raise `hnsw_ef`, then `m`.
-- Exact search also misses it: the index is fine. The problem is the chunk (too long, truncated at 256 tokens, badly split), the embedding model, or the question wording. Use chunking changes, query rewriting, hybrid search or reranking.
-
 ### 14.9 What to add first (for our app)
 
 | Order | Step | Why it comes first |
@@ -2349,49 +2283,6 @@ The decision order that avoids rework:
 
 The parameters that **force re-embedding all documents** when changed: embedding model, dimensions, chunk size and overlap (and the distance metric, which needs a new collection). `m` and `ef_construct` only make Qdrant rebuild its graph in the background, with no re-embedding. The ones you can change at any time: K, score threshold, `hnsw_ef`, filters, the prompt and the LLM.
 
-### 15.8 Design review order (simple version)
-
-Walk through these in order when you design or review a RAG system. Each line is the question to answer.
-
-| Step | Area | Decide or check |
-|---|---|---|
-| 0 | Requirements | Which questions, which documents, how many users? |
-| 1 | Ingestion | Upload caps (file size, pages, chunks) and chunk size and overlap. Chunk count ≈ characters ÷ (size - overlap) |
-| 2 | Embedding model | Dimension and token limit. Chunks must fit the limit. Changing the model later means re-embedding everything |
-| 3 | Vector DB layout | Collection layout (per user or shared with a `userId` filter), distance metric, payload fields, payload indexes for every filter field |
-| 4 | Size limits | Payload and request size limits, vectors × 384 × 4 × 1.5 for RAM, payload on disk |
-| 5 | HNSW settings | `m`, `ef_construct` (set at creation), `hnsw_ef` (set per search). See the table below |
-| 6 | Growth | Plan a v2 collection only for the reasons in the table below |
-| 7 | Retrieval quality | Top-K, score threshold, test with the evaluation set. Add reranking and measure |
-| 8 | LLM fit | Prompt budget ≤ usable context. Worst-case time to first token, tokens per second, GPU memory (section 16) |
-| 9 | Evaluation | Retrieval metrics, then response metrics, then system metrics (14.8) |
-
-**HNSW settings in plain words:**
-
-| Setting | What it really does | Higher value means | Affects put latency? |
-|---|---|---|---|
-| `m` | Maximum links per node | Better recall, more RAM, slower graph building, slightly slower search | Not the put call itself. Indexing runs in the background, so it takes longer and uses more CPU |
-| `ef_construct` | How many candidates are examined to find the best links **when a point is added** (not how many links it gets, that is `m`) | Better graph, slower indexing | Same: background indexing time, not the put call |
-| `hnsw_ef` | How many candidates are kept **while searching** | Better recall, slower search | No, it only affects searches |
-
-A put returns once the point is stored (and, with `wait=true`, applied and searchable). A new point is found by a brute-force scan until background indexing adds it to the graph (13.3).
-
-**When do you need a v2 collection?**
-
-| Reason | v2 needed? |
-|---|---|
-| More data (size growth) | No. Use quantization, on-disk vectors or sharding (13.4) |
-| Change `m`, `ef_construct` or `hnsw_ef` | No. They apply to the existing collection with no re-embedding |
-| New embedding model or dimension | **Yes** |
-| New distance metric | **Yes** |
-| New chunk size or overlap | **Yes** (re-embed) |
-| Moving to hybrid search (named dense + sparse vectors) | **Yes** |
-| Moving from per-user collections to one shared collection | **Yes** |
-
-To switch, create `docs_v2`, re-index, point the app at it, then drop the old one (15.6).
-
-**Using `hnsw_ef` to fix correctness:** raising it only helps when the ANN search misses a chunk an exact search would find. Test with an exact search first (the check at the end of 14.8). If exact also misses the chunk, change chunking, rewriting, hybrid search or reranking instead.
-
 ---
 
 ## 16. Sizing the LLM system: formulas and worked example
@@ -2442,50 +2333,6 @@ What the formulas say:
 - Prefill time grows **linearly plus quadratically** with the prompt length (the $n^2$ attention term).
 - Generation speed falls slowly as the context grows, because the KV cache must be read for every token.
 - Quantizing the weights shrinks $M_w$, which helps fit **and** speeds up generation. It barely changes prefill time.
-
-#### Design calculations: what do I need?
-
-The two rules of thumb, and their reverse forms for choosing hardware and prompt limits.
-
-**Prefill (time to first token) is limited by compute.** Each prompt token costs about 2 FLOPs per weight:
-
-$$F_{prefill} \approx 2 \times P \times n \qquad\Rightarrow\qquad \text{TFLOPs needed} = 2 \times \text{weights} \times \text{prompt tokens}$$
-
-- The KV cache is **not** multiplied in here. It only enters through the attention term $2\,n^2\,d_{model}\,L$, which is small for short prompts (about 5% at 2,000 tokens, about 25% at 12,000).
-- Quantizing does not reduce it: the number of weights is the same.
-- FLOPs (work) and FLOPS (speed per second) are different units. Required hardware speed for a first-token target:
-
-$$\text{TFLOPS}_{req} = \frac{F_{prefill}}{T_{target}} \qquad\qquad n_{TTFT} \approx \frac{\text{FLOPS}_{eff} \times T_{target}}{2P}$$
-
-$n_{TTFT}$ is the **prompt limit** that keeps the first token within the target. It comes out slightly lower once the attention term is included.
-
-**Decode (tokens per second) is limited by memory bandwidth.** Every generated token reads all weights plus the KV cache so far:
-
-$$\text{tok/s} = \frac{BW}{M_w + M_{kv}} \qquad\Rightarrow\qquad BW_{req} = \text{tok/s}_{target} \times (M_w + M_{kv})$$
-
-- $M_w$ is the weights **in their stored format** (4-bit weights count as about 0.6 bytes each), so quantizing speeds this up.
-- $M_{kv} = n \times m_{kv}$ grows with the context, so speed drops as the conversation gets longer.
-
-**Prompt limit for the app** is the smallest of the three limits, minus room for the answer:
-
-$$n_{prompt} = \min(n_{model},\ n_{max},\ n_{TTFT}) - n_{out}$$
-
-Worked examples (3B model in 4-bit: $P$ = 3.2B, weights 2.0 GB, $d_{model}$ = 3072, $L$ = 28):
-
-```
-Compute needed (prefill)
-  3,000-token prompt: 2 × 3.2e9 × 3,000 = 19.2 TFLOPs (+ 1.5 attention = 20.7 TFLOPs)
-  first token within 2 s  -> need about 10 TFLOPS      (a 5 TFLOPS GPU needs 4.2 s)
-
-Prompt limit from a first-token target
-  GPU gives 5 TFLOPS, target 3 s -> budget 15 TFLOPs
-  n = 15e12 ÷ (2 × 3.2e9) = about 2,300 tokens; with the attention term about 2,200
-  -> cap the prompt (chunks + history + instructions + question) at about 2,200 tokens
-
-Bandwidth needed (decode)
-  want 30 tok/s, context 4,000 tokens: weights 2.0 GB + KV 0.46 GB = 2.46 GB per token
-  30 × 2.46 = about 74 GB/s needed                    (100 GB/s gives about 40 tok/s)
-```
 
 ### 16.3 Worked example: a 4 GB GPU
 
@@ -2539,7 +2386,7 @@ On a small GPU the **answer length** usually costs more time than the prompt. Cu
 2. Choose the number format: the highest bits whose weights still leave room for the KV cache you need.
 3. Compute $m_{kv}$ and $n_{max}$ for your VRAM and expected $S$.
 4. Set `num_ctx` explicitly to the usable context (not the model maximum), and make sure the RAG prompt budget fits inside it.
-5. Estimate $T_{prefill}$ for a typical prompt and tok/s at a typical context, then **measure** both on the real machine. Use the reverse forms above to get the prompt limit ($n_{TTFT}$) and the bandwidth you need.
+5. Estimate $T_{prefill}$ for a typical prompt and tok/s at a typical context, then **measure** both on the real machine.
 6. If the numbers are not acceptable, change the knob that matches the symptom:
 
 | Symptom | Likely cause | What to change |
