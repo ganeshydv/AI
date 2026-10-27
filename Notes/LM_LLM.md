@@ -992,7 +992,9 @@ Prefill is compute-bound because the 2,000 prompt tokens are multiplied as one b
 
 **Decode.** To produce one token the GPU must read the whole weights and the whole KV cache from memory:
 
-$$\text{tokens/s} \approx \frac{BW}{M_{weights} + n \times m_{kv}}$$
+$$\text{tokens/s} \approx \frac{BW}{M_{weights} + M_{kv}}, \qquad M_{kv} = n \times m_{kv}$$
+
+$M_{kv}$ is the **total** KV cache for the context ($m_{kv}$ is the cache per token, so $n$ tokens give $n \times m_{kv}$). The speed is memory bandwidth divided by the bytes read per token: all weights + the whole KV cache.
 
 The arithmetic for one token is only about $2P$ = 6.4 GFLOPs (about 1 ms at 5 TFLOPS), but reading 2.5 GB at 100 GB/s takes about 25 ms. The GPU waits on memory, which is why decode is called **bandwidth-bound**. Example (assumed 100 GB/s effective, 3B model):
 
@@ -1016,7 +1018,7 @@ With several requests at once, the weights are read once per step for all of the
 | Max tokens in memory | $n_{max} = \dfrac{\text{VRAM} - M_w - M_{overhead}}{m_{kv} \times S}$ |
 | Usable context | $\min(n_{model},\ n_{max})$, then set `num_ctx` to it |
 | Time to first token | $T_{prefill} \approx \dfrac{2\,P\,n + 2\,n^2\,d_{model}\,L}{\text{FLOPS}_{eff}}$ |
-| Generation speed | $\text{tok/s} \approx \dfrac{BW}{M_w + n \times m_{kv}}$ |
+| Generation speed | $\text{tok/s} \approx \dfrac{BW}{M_w + M_{kv}}$ (total weights + total KV cache) |
 | Total answer time | $T \approx T_{prefill} + \dfrac{n_{out}}{\text{tok/s}}$ |
 
 These are estimates: real speeds are below the peak numbers (use the GPU's memory bandwidth for $BW$ and measure real tokens per second).
@@ -1027,7 +1029,7 @@ These are estimates: real speeds are below the peak numbers (use the GPU's memor
 2. **Work:** $F_{prefill} = 2Pn + 2n^2 d_{model} L$.
 3. **Time to first token:** $T_{prefill} = F_{prefill} / \text{FLOPS}_{eff}$. Decode time is not part of it.
 4. **Memory fit (separate check, not added to time):** $M_w + n \times m_{kv} + M_{overhead} \le \text{VRAM}$.
-5. **Decode speed:** $\text{tok/s} \approx BW / (M_w + n \times m_{kv})$.
+5. **Decode speed:** $\text{tok/s} \approx BW / (M_w + M_{kv})$, with $M_{kv} = n \times m_{kv}$.
 6. **Total answer time:** $T_{prefill} + n_{out} / \text{tok/s}$, where $n_{out}$ is the answer length.
 7. Do it for both your typical prompt and the maximum, then verify with `ollama run <model> --verbose`.
 
