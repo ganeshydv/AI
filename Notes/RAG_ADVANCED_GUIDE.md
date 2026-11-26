@@ -138,12 +138,13 @@ Both vectors live on the same point as named vectors. Sparse is computed at inde
 
 ```json
 {
-  "id": "doc12_p7_fig2",
+  "id": "b3f1c0de-5a7e-5c1a-9d2b-3e8f6a1c4d70",
   "vectors": {
     "dense":  [0.012, -0.44],
     "sparse": { "indices": [1021, 5530, 90412], "values": [1.8, 0.9, 2.4] }
   },
   "payload": {
+    "chunk_id": "doc12_p7_fig2",
     "doc_id": "doc12",
     "page": 7,
     "type": "image",
@@ -157,6 +158,8 @@ Both vectors live on the same point as named vectors. Sparse is computed at inde
 ```
 
 Embed the searchable text. Keep the raw table or image in the payload or S3.
+
+Qdrant point ids must be an unsigned integer or a UUID. Generate a deterministic UUID (for example `uuid5(NAMESPACE, "doc12_p7_fig2")`) so re-ingesting the same chunk overwrites it, and keep the readable id in the payload as `chunk_id`.
 
 ### How sparse (BM25) works
 
@@ -262,7 +265,375 @@ $$
 
 B wins because both retrievers rank it well.
 
-## 5. End-to-end summary
+## 5. API walkthrough (Qdrant REST, in flow order)
+
+Base URL `http://localhost:6333`. Add the header `api-key: <key>` if auth is enabled. Collection name: `docs`.
+
+### 5.1 Ingestion APIs (in order)
+
+| Order | Call | Purpose |
+| --- | --- | --- |
+| 1 | `PUT /collections/docs` | Create collection with dense and sparse vector slots |
+| 2 | `PUT /collections/docs/index` | Create payload indexes for filter fields |
+| 3 | Parse PDF (Docling) | Typed blocks, no vector DB call |
+| 4 | VLM / LLM call | Caption images, summarize tables, explain formulas |
+| 5 | Dense embedding call | Chunk text to float vector |
+| 6 | BM25 sparse encoding | Chunk text to `{indices, values}` |
+| 7 | Upload crop/raw table to S3 | Get `asset_url` |
+| 8 | `PUT /collections/docs/points` | Upsert chunks with both vectors and payload |
+
+**Step 1. Create the collection**
+
+`PUT /collections/docs`
+
+```json
+{
+  "vectors": {
+    "dense": { "size": 1024, "distance": "Cosine" }
+  },
+  "sparse_vectors": {
+    "sparse": { "modifier": "idf" }
+  }
+}
+```
+
+`size` must equal the output dimension of your dense embedding model (1024 for bge-m3). `modifier: idf` makes Qdrant compute the IDF part of BM25 on the server.
+
+**Step 2. Create payload indexes (before loading data)**
+
+`PUT /collections/docs/index?wait=true`, one call per field:
+
+```json
+{ "field_name": "doc_id", "field_schema": "keyword" }
+```
+```json
+{ "field_name": "type", "field_schema": "keyword" }
+```
+```json
+{ "field_name": "page", "field_schema": "integer" }
+```
+```json
+{ "field_name": "year", "field_schema": "integer" }
+```
+
+**Step 3. Parse the PDF with Docling** (no Qdrant call)
+
+What Docling gives you in this step:
+
+| Capability | What it does | Why it matters for RAG |
+| --- | --- | --- |
+| Layout analysis | Labels each region: `section_header`, `text`, `list_item`, `table`, `picture`, `formula`, `code`, `caption`, `page_header`, `page_footer` | You know the block type without guessing, so each type gets its own handling |
+| Reading order | Orders blocks as a human would read them, including multi-column pages | Chunks are in the correct sequence |
+| Section hierarchy | Links each block to its parent heading | Fills the `section` payload and lets you prepend headings to chunks |
+| Table structure (TableFormer) | Recovers rows, columns, merged cells and headers | Tables can be exported as Markdown, HTML or a DataFrame instead of garbled text |
+| OCR | Runs EasyOCR, Tesseract or RapidOCR on scanned pages and image regions. Set `force_full_page_ocr` for fully scanned PDFs | One pipeline for digital and scanned pages |
+| Formula enrichment | Converts formula regions to LaTeX (`do_formula_enrichment`) | Searchable and readable formulas |
+| Picture handling | Crops each picture (`generate_picture_images`), links its caption, and can classify it (chart, diagram, logo) | Feeds the VLM step and skips decorative images |
+| Provenance | Every item has `page_no` and `bbox` | Page citations and linking chunks back to the PDF |
+| Structure-aware chunking | `HybridChunker` splits by document structure and token limit, and keeps headings in chunk metadata | Better chunks than fixed-size splitting |
+| Export formats | Markdown, HTML, lossless JSON (`DoclingDocument`) | Store the JSON to re-chunk later without re-parsing |
+
+What it does not do: it does not understand charts (a VLM does that), and it does not reliably read handwriting.
+
+```python
+from docling.document_converter import DocumentConverter, PdfFormatOptions
+from docling.datamodel.base_models import InputFormat
+from docling.datamodel.pipeline_options import PdfPipelineOptions
+from docling.chunking import HybridChunker
+
+opts = PdfPipelineOptions()
+opts.do_ocr = True                     # OCR on scanned pages and image regions
+opts.do_table_structure = True         # TableFormer
+opts.do_formula_enrichment = True      # formulas to LaTeX
+opts.generate_picture_images = True    # keep crops of figures
+opts.images_scale = 2.0                # sharper crops for the VLM
+
+converter = DocumentConverter(
+    format_options={InputFormat.PDF: PdfFormatOptions(pipeline_options=opts)}
+)
+doc = converter.convert("doc12.pdf").document
+
+# Walk typed items in reading order
+for item, level in doc.iterate_items():
+    page = item.prov[0].page_no
+    bbox = item.prov[0].bbox
+    label = item.label.value                 # "table", "picture", "text", "formula", ...
+    if label == "table":
+        md = item.export_to_markdown(doc=doc)    # also export_to_html / export_to_dataframe
+    elif label == "picture":
+        img = item.get_image(doc)                # PIL image to upload to S3 and send to the VLM
+        caption = item.caption_text(doc)         # nearby caption, useful VLM context
+    else:
+        text = item.text
+
+# Structure-aware chunks with their headings
+chunker = HybridChunker()
+for chunk in chunker.chunk(dl_doc=doc):
+    headings = chunk.meta.headings               # section path, e.g. ["3 Results", "3.2 Financial Results"]
+    text = chunker.contextualize(chunk)          # chunk text with headings prepended
+```
+
+Parsed item, as you would keep it before enrichment:
+
+```json
+{
+  "type": "picture",
+  "page": 7,
+  "bbox": [72, 300, 520, 640],
+  "section": "3.2 Financial Results",
+  "caption": "Figure 2. Quarterly revenue",
+  "image_path": "crops/doc12_p7_fig2.png"
+}
+```
+
+Typical use: tables and text use Docling's output directly. Pictures go to S3 and the VLM (step 4). Low-confidence OCR regions and handwriting go to the VLM as well.
+
+**Step 4. VLM caption for a figure** (OpenAI-compatible chat API)
+
+`POST {VLM_URL}/v1/chat/completions`
+
+```json
+{
+  "model": "gpt-4o",
+  "messages": [
+    {
+      "role": "user",
+      "content": [
+        { "type": "text", "text": "Section: 3.2 Financial Results. Caption: Figure 2. Describe this chart and list the data values." },
+        { "type": "image_url", "image_url": { "url": "data:image/png;base64,<BASE64>" } }
+      ]
+    }
+  ]
+}
+```
+
+The answer in `choices[0].message.content` becomes the chunk text, together with the PP-OCR labels.
+
+**Steps 5 and 6. Dense and sparse embeddings of the same chunk text**
+
+Dense (OpenAI-compatible embeddings API, for example a self-hosted bge-m3):
+
+`POST {EMBED_URL}/v1/embeddings`
+
+```json
+{
+  "model": "bge-m3",
+  "input": ["Section 3.2 Financial Results. Bar chart: quarterly revenue Q1-Q4 2024, 2.1M to 3.4M"]
+}
+```
+
+Response: `data[0].embedding` is the float array (1024 values).
+
+Sparse BM25 has no HTTP call in open-source Qdrant. It is computed client-side with FastEmbed:
+
+```python
+from fastembed import SparseTextEmbedding
+
+bm25 = SparseTextEmbedding("Qdrant/bm25")
+texts = ["Section 3.2 Financial Results. Bar chart: quarterly revenue Q1-Q4 2024, 2.1M to 3.4M"]
+
+# Index side: term frequency weights with length normalization
+sp = list(bm25.embed(texts))[0]
+sparse_vec = {"indices": sp.indices.tolist(), "values": sp.values.tolist()}
+```
+
+Sparse output example: `{"indices": [1021, 5530, 90412], "values": [1.8, 0.9, 2.4]}`. IDF is applied by Qdrant at search time because of `modifier: idf`.
+
+**Step 8. Upsert points**
+
+`PUT /collections/docs/points?wait=true`
+
+```json
+{
+  "points": [
+    {
+      "id": "b3f1c0de-5a7e-5c1a-9d2b-3e8f6a1c4d70",
+      "vector": {
+        "dense": [0.012, -0.44, 0.09],
+        "sparse": { "indices": [1021, 5530, 90412], "values": [1.8, 0.9, 2.4] }
+      },
+      "payload": {
+        "chunk_id": "doc12_p7_fig2",
+        "doc_id": "doc12",
+        "page": 7,
+        "year": 2024,
+        "type": "image",
+        "section": "3.2 Financial Results",
+        "text": "Bar chart: quarterly revenue Q1-Q4 2024, 2.1M to 3.4M",
+        "bbox": [72, 300, 520, 640],
+        "asset_url": "s3://bucket/doc12/p7_fig2.png"
+      }
+    }
+  ]
+}
+```
+
+Send points in batches (for example 64 to 256 per request). The dense array is shortened here for display.
+
+### 5.2 Query APIs (in order)
+
+| Order | Call | Purpose |
+| --- | --- | --- |
+| 1 | LLM chat call | Rewrite the question with history, optionally extract filters |
+| 2 | Dense embedding call | Query to dense vector |
+| 3 | BM25 query encoding | Query to sparse vector |
+| 4 | `POST /collections/docs/points/query` | Filtered dense and sparse search with RRF fusion |
+| 5 | Reranker call | Cross-encoder scores top candidates |
+| 6 | `POST /collections/docs/points/scroll` | Fetch neighbouring chunks |
+| 7 | S3 presigned GET | Fetch the original image |
+| 8 | LLM chat call | Final answer |
+
+**Step 1. Rewrite and filter extraction**
+
+`POST {LLM_URL}/v1/chat/completions`
+
+```json
+{
+  "model": "gpt-4o-mini",
+  "response_format": { "type": "json_object" },
+  "messages": [
+    { "role": "system", "content": "Rewrite the last question as a standalone query using the history. Return JSON: {\"query\": string, \"filters\": {\"year\": int|null, \"type\": string|null}}" },
+    { "role": "user", "content": "History: Q: Show 2024 revenue. A: Q1 2.1M ... \nQuestion: what about Q4?" }
+  ]
+}
+```
+
+Example result: `{"query": "2024 revenue in Q4", "filters": {"year": 2024, "type": null}}`.
+
+**Steps 2 and 3. Encode the rewritten query**
+
+```json
+{ "model": "bge-m3", "input": ["2024 revenue in Q4"] }
+```
+
+```python
+sp = list(bm25.query_embed("2024 revenue in Q4"))[0]
+query_sparse = {"indices": sp.indices.tolist(), "values": sp.values.tolist()}
+```
+
+`query_embed` is the query-side function: it keeps which terms are present, without length normalization.
+
+**Step 4. Hybrid search: filtered dense + sparse, fused with RRF**
+
+`POST /collections/docs/points/query`
+
+```json
+{
+  "prefetch": [
+    {
+      "query": [0.031, -0.12, 0.27],
+      "using": "dense",
+      "limit": 30,
+      "filter": { "must": [ { "key": "year", "match": { "value": 2024 } } ] }
+    },
+    {
+      "query": { "indices": [1021, 7710], "values": [1.0, 1.0] },
+      "using": "sparse",
+      "limit": 30,
+      "filter": { "must": [ { "key": "year", "match": { "value": 2024 } } ] }
+    }
+  ],
+  "query": { "fusion": "rrf" },
+  "limit": 20,
+  "with_payload": true
+}
+```
+
+The filter is repeated inside each prefetch so both searches are constrained. The response lists points with `id`, `score` (the RRF score) and `payload`.
+
+Common filter shapes:
+
+```json
+{ "must": [ { "key": "doc_id", "match": { "value": "doc12" } }, { "key": "type", "match": { "any": ["table", "image"] } } ] }
+```
+
+```json
+{ "must": [ { "key": "page", "range": { "gte": 5, "lte": 9 } } ] }
+```
+
+**Step 5. Cross-encoder rerank** (for example a bge-reranker served by Hugging Face TEI)
+
+`POST {RERANK_URL}/rerank`
+
+```json
+{
+  "query": "2024 revenue in Q4",
+  "texts": ["<payload.text of hit 1>", "<payload.text of hit 2>", "<payload.text of hit 20>"]
+}
+```
+
+Response: `[{"index": 7, "score": 0.97}, {"index": 2, "score": 0.91}, ...]`. Sort by `score` and keep the top 5.
+
+**Step 6. Expand with neighbouring chunks**
+
+`POST /collections/docs/points/scroll`
+
+```json
+{
+  "filter": {
+    "must": [
+      { "key": "doc_id", "match": { "value": "doc12" } },
+      { "key": "page", "range": { "gte": 6, "lte": 8 } }
+    ]
+  },
+  "limit": 20,
+  "with_payload": true,
+  "with_vector": false
+}
+```
+
+To fetch known points by id instead, use `POST /collections/docs/points` with `{"ids": ["<uuid>"], "with_payload": true}`.
+
+**Step 7. Fetch the image.** Generate a presigned S3 GET URL from `payload.asset_url` (SDK call, no Qdrant API), then download it or pass it to the LLM.
+
+**Step 8. Final answer with text and image**
+
+`POST {LLM_URL}/v1/chat/completions`
+
+```json
+{
+  "model": "gpt-4o",
+  "messages": [
+    { "role": "system", "content": "Answer only from the context. Cite doc and page." },
+    {
+      "role": "user",
+      "content": [
+        { "type": "text", "text": "Context:\n[doc12 p7] Bar chart: quarterly revenue ...\n[doc12 p8] Q4 revenue table ...\n\nQuestion: what about Q4?" },
+        { "type": "image_url", "image_url": { "url": "https://<presigned-s3-url>" } }
+      ]
+    }
+  ]
+}
+```
+
+### 5.3 Whole flow as client code
+
+```python
+# INGEST (per chunk batch)
+texts = [c["text"] for c in chunks]
+dense = embed_dense(texts)                       # POST /v1/embeddings
+sparse = list(bm25.embed(texts))                 # FastEmbed Qdrant/bm25
+qdrant.upsert("docs", points=[
+    PointStruct(id=uuid5(NS, c["chunk_id"]),
+                vector={"dense": d, "sparse": SparseVector(indices=s.indices.tolist(), values=s.values.tolist())},
+                payload=c["payload"])
+    for c, d, s in zip(chunks, dense, sparse)
+])
+
+# QUERY
+q = rewrite(question, history)                   # LLM call
+qd = embed_dense([q["query"]])[0]
+qs = list(bm25.query_embed(q["query"]))[0]
+hits = qdrant.query_points("docs", prefetch=[
+    Prefetch(query=qd, using="dense", limit=30, filter=flt),
+    Prefetch(query=SparseVector(indices=qs.indices.tolist(), values=qs.values.tolist()),
+             using="sparse", limit=30, filter=flt),
+], query=FusionQuery(fusion=Fusion.RRF), limit=20, with_payload=True).points
+top5 = rerank(q["query"], hits)[:5]              # POST /rerank
+answer = llm_answer(q["query"], expand(top5))    # chat call with text + image
+```
+
+## 6. End-to-end summary
 
 ```text
 INDEX: PDF -> page classify -> layout blocks -> per-type extraction + VLM/LLM enrichment
@@ -274,18 +645,18 @@ QUERY: question + history -> rewrite -> (filters)
        -> expand (parents, image, raw table) -> LLM -> answer + citations
 ```
 
-## 6. Large PDFs and cost
+## 7. Large PDFs and cost
 
 - Process page by page in a queue with parallel workers.
 - Use OCR only on pages with no text layer.
 - Batch VLM calls and cache by image hash.
 - Re-ingest only changed pages (hash per page).
 
-## 7. Alternative: skip OCR with ColPali / ColQwen
+## 8. Alternative: skip OCR with ColPali / ColQwen
 
 These models embed whole page images, so layout, charts and tables are handled in one step. Retrieval is strong for visually complex documents, but storage is heavier and a multi-vector store is needed (Qdrant and Vespa support this). Many teams combine both: parsed text for the main path, ColPali for visually heavy pages.
 
-## 8. Tool choices
+## 9. Tool choices
 
 - Simplest: Docling or Unstructured, plus a VLM for figures.
 - Open-source OCR/layout: PP-StructureV3 or MinerU.
